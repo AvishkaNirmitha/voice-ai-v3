@@ -171,8 +171,15 @@ def main() -> None:
 
     if "--source" in args:
         src = match_source(sources, args[args.index("--source") + 1])
-    elif "--laptop" in args:
-        src = match_source(sources, "pci-")
+    elif "--laptop" in args or "--onboard" in args:
+        # The built-in mic is whatever real ALSA capture device is not the
+        # array. Matching on "pci-" would miss it on a Jetson or a Pi, where
+        # onboard audio shows up as platform-/tegra- instead.
+        builtin = [s for s in sources
+                   if s["name"].startswith("alsa_input.") and "respeaker" not in s["name"].lower()]
+        if not builtin:
+            sys.exit("No built-in mic found. Run with --list to see what is available.")
+        src = builtin[0]
     elif "--respeaker" in args:
         src = match_source(sources, "respeaker")
     else:
