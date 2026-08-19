@@ -1,0 +1,15 @@
+node_modules
+__pycache__
+.venv
+.env
+.env*
+recordings/
+
+**.wav
+
+AEC_fix.txt
+AEC_SETUP_GUIDE.md
+chat_related_AEC_working.txt
+command.txt
+**.onnx
+**.wav

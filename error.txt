@@ -1,0 +1,176 @@
+e generallyALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+ highly regarded, especially within the gaming community, for performance and reliability.
+ Are you
+are generally high
+They areALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+ generally highly regarded in the gaming and enthusiast
+They are gentle.
+
+Their motherboardsALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+ are generally highly regarded, particularly by gamers
+Their motherboard
+They areALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+ALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+ generally highly regarded
+They are genuine.
+
+Their motherboardsALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+ALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+ are generally highly regarded, especially within the gaming and enthusiast communities, though performance can vary depending on the specific model.
+ Are you looking
+Their motherboard
+Their motherboardsALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+ are generally held in high regard,
+Their mother
+They areALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+ generally highly regarded, particularly by gamers and custom PC builders, known for their features and performance.
+ Though individual opinions can vary depending on the model.
+ Is there a specific feature you're interested in?
+
+by gameers and custom
+and customALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+ builders, due to their features and stability with high-performance parts.
+ They produce several lines catering to different needs.
+ Are you interested in a specific model or feature?
+
+with hyper performance
+high-performance components.
+ALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+ They offer models for various budgets and needs.
+ Are you considering a specific model?
+ I can provide more details if you'd like.
+
+Go budget tone. And I I want to compare both. I want to low budget motherboard chipset and high high budget. Motherboard chipset.
+
+Comparing chipsetALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+ lines, low-budget
+comparing chipsets
+Comparing chipsetsALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+ALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+
+Comparing two
+generally meansALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+ looking at features like CPU support, memory capacity and speed, available PCIe lanes for graphics and expansion, and the number of USB and SATA ports.
+ High-budget chipsets typically offer more of everything, better options for overclocking, and more advanced connectivity, while low-budget ones cover the essentials for standard use without extra features.
+ Are you looking to compare specific chipsets?
+ Knowing the generation or CPU type would help.
+
+How much they ghost they ghost?
+
+Motherboard pricesALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+ vary quite a bit, depending on the chipset, brand, and added features.
+ Entry-level motherboards can start as low as perhaps fifty dollars, while high-end ones can easily exceed several hundred dollars, sometimes even more, especially for enthusiast platforms.
+ Are you looking for a price range for a specific type of system?
+
+exceed several hundred
+exactly. High-endALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+ALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+ motherboards can exceed
+Exactly.
+
+High-end models canALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+ even cost over five hundred dollars depending on the platform and specifications.
+
+I I I I Hello, listen. I didn't catch that. What did you say?
+
+I wasALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+ALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+ just clarifying the price range.
+
+I was just
+I wasALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+ justALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+ confirming that high-end motherboards can cost several hundred dollars or more, depending on their features and capabilities.
+ There's a wide range available.
+ Were you looking to clarify that specific point?
+
+Bhaiya mat bolo.
+
+Understood. IALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+ was stating
+Understood.
+
+I wasALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+ just saying that high-end—
+I would just say
+I was just saying that pricesALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+ALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+ vary quite a bit, from under fifty dollars up to several hundred dollars or more, depending on features and quality.
+ Were you looking for a specific price range?
+
+No. I am looking for bit bit bit low price.
+
+For aALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+ lower price range, you'll want to focus on motherboards based on entry-level chipsets.
+
+for a long time
+For aALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+ALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+ lower-priced option, motherboards
+for a little bit
+For aALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+ lower-priced option, you'd be looking at motherboards with chipsets designed for core functionality rather than advanced overclocking or maximum features.
+ Brands like Jettl, MSI, and many others have budget-friendly options.
+ Do you require a specific CPU socket?
+
+will require a specific Did you stop it?
+
+I pausedALSA lib pcm.c:8568:(snd_pcm_recover) underrun occurred
+ briefly.
+ I was about to ask if you require a specific CPU socket or feature set for your computer.
+ Continuing monitoring now.
+Expression 'alsa_snd_pcm_poll_descriptors_revents( self->pcm, pfds, self->nfds, &revents )' failed in 'src/hostapi/alsa/pa_linux_alsa.c', line: 3665
+Expression 'PaAlsaStreamComponent_EndPolling( &self->capture, capturePfds, &pollCapture, &xrun )' failed in 'src/hostapi/alsa/pa_linux_alsa.c', line: 3887
+Expression 'PaAlsaStream_WaitForFrames( stream, &framesAvail, &xrun )' failed in 'src/hostapi/alsa/pa_linux_alsa.c', line: 4434
+Expression 'res' failed in 'src/hostapi/alsa/pa_linux_alsa.c', line: 3502
+Expression 'PaAlsaStreamComponent_EndProcessing( &self->playback, numFrames, &xrun )' failed in 'src/hostapi/alsa/pa_linux_alsa.c', line: 3601
+Expression 'PaAlsaStream_EndProcessing( stream, framesGot, &xrun )' failed in 'src/hostapi/alsa/pa_linux_alsa.c', line: 4495
+
+Connection closed.
+  + Exception Group Traceback (most recent call last):
+  |   File "/home/asus/Desktop/works/51/command-line/python/main.py", line 153, in <module>
+  |     asyncio.run(run())
+  |   File "/home/asus/snap/code/255/.local/share/uv/python/cpython-3.12.12-linux-x86_64-gnu/lib/python3.12/asyncio/runners.py", line 195, in run
+  |     return runner.run(main)
+  |            ^^^^^^^^^^^^^^^^
+  |   File "/home/asus/snap/code/255/.local/share/uv/python/cpython-3.12.12-linux-x86_64-gnu/lib/python3.12/asyncio/runners.py", line 118, in run
+  |     return self._loop.run_until_complete(task)
+  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |   File "/home/asus/snap/code/255/.local/share/uv/python/cpython-3.12.12-linux-x86_64-gnu/lib/python3.12/asyncio/base_events.py", line 691, in run_until_complete
+  |     return future.result()
+  |            ^^^^^^^^^^^^^^^
+  |   File "/home/asus/Desktop/works/51/command-line/python/main.py", line 138, in run
+  |     async with asyncio.TaskGroup() as tg:
+  |                ^^^^^^^^^^^^^^^^^^^
+  |   File "/home/asus/snap/code/255/.local/share/uv/python/cpython-3.12.12-linux-x86_64-gnu/lib/python3.12/asyncio/taskgroups.py", line 71, in __aexit__
+  |     return await self._aexit(et, exc)
+  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |   File "/home/asus/snap/code/255/.local/share/uv/python/cpython-3.12.12-linux-x86_64-gnu/lib/python3.12/asyncio/taskgroups.py", line 164, in _aexit
+  |     raise BaseExceptionGroup(
+  | ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)
+  +-+---------------- 1 ----------------
+    | Traceback (most recent call last):
+    |   File "/home/asus/Desktop/works/51/command-line/.venv/lib/python3.12/site-packages/google/genai/live.py", line 527, in _receive
+    |     raw_response = await self._ws.recv(decode=False)
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |   File "/home/asus/Desktop/works/51/command-line/.venv/lib/python3.12/site-packages/websockets/asyncio/connection.py", line 324, in recv
+    |     raise self.protocol.close_exc from self.recv_exc
+    | websockets.exceptions.ConnectionClosedError: received 1008 (policy violation) Connection aborted because the client failed to close the connection after receiving a GoAway signal once the session durat; then sent 1008 (policy violation) Connection aborted because the client failed to close the connection after receiving a GoAway signal once the session durat
+    | 
+    | During handling of the above exception, another exception occurred:
+    | 
+    | Traceback (most recent call last):
+    |   File "/home/asus/Desktop/works/51/command-line/python/main.py", line 89, in receive_audio
+    |     async for response in turn:
+    |   File "/home/asus/Desktop/works/51/command-line/.venv/lib/python3.12/site-packages/google/genai/live.py", line 446, in receive
+    |     while result := await self._receive():
+    |                     ^^^^^^^^^^^^^^^^^^^^^
+    |   File "/home/asus/Desktop/works/51/command-line/.venv/lib/python3.12/site-packages/google/genai/live.py", line 537, in _receive
+    |     errors.APIError.raise_error(code, reason, None)
+    |   File "/home/asus/Desktop/works/51/command-line/.venv/lib/python3.12/site-packages/google/genai/errors.py", line 188, in raise_error
+    |     raise cls(status_code, response_json, response)
+    | google.genai.errors.APIError: 1008 None. Connection aborted because the client failed to close the connection after receiving a GoAway signal once the session durat
+    +------------------------------------
+(51) asus@asus-ASUS-TUF-Gaming-A15-FA507NVR-FA507NVR:~/Desktop/works/51/command-line/python$ ^C
+(51) asus@asus-ASUS-TUF-Gaming-A15-FA507NVR-FA507NVR:~/Desktop/works/51/command-line/python$ ^C
+(51) asus@asus-ASUS-TUF-Gaming-A15-FA507NVR-FA507NVR:~/Desktop/works/51/command-line/python$ 
