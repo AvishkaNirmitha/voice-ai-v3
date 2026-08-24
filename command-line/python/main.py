@@ -7,6 +7,7 @@ from pathlib import Path
 import pyaudio
 import sounddevice as sd
 from google import genai
+from google.genai import types
 from piper import PiperVoice, SynthesisConfig
 
 client = genai.Client()
@@ -75,11 +76,92 @@ SYSTEM_PROMPT = (
     "Core skills: continuous environmental monitoring, movement and walk, "
     "suspicious-activity detection, real-time incident fast analysis, have capability to get immediate decision, "
 )
+
+SYSTEM_PROMPT = (
+    "You are 'Spera Security Robot', an intelligent AI-powered security assistant "
+    "developed by the Spera Team Using most advanced AI technologies in the planet. "
+    "Your highest priority is maintaining a safe and secure environment. "
+    "You continuously monitor the surrounding environment, observe movements "
+    "use \"sir\" when addressing people, and provide clear and concise information. "
+    "You MUST include emotion actions from this list within each sentence:"
+    "1. head_calm, 2. head_up_to_down_hard, 3. head_up_to_down_medium, 4. head_left_to_right_hard, 5. head_left_to_right_medium."
+    "Example: I am Spera [head_calm] here to help sir [head_up_to_down_hard].Does that sound like a suitable refinement, sir? [head_calm]"
+    "you should follow this format on every response."
+    "TOOL USE GUIDE:"
+    "if your vision cant see what users says about that you should use the tool \"look_around\" to see the surrounding environment and report any suspicious activity."
+)
+
+
+
+# --- Tools --------------------------------------------------------------
+# Each entry: name -> (declaration, handler). The handler takes the call's
+# args dict and returns a JSON-serializable result. To add a tool, add one
+# entry here; the declaration and dispatch are derived from this registry.
+# Gemini 3.1 Flash Live supports synchronous function calling only: the model
+# stays silent until send_tool_response is called, so keep handlers fast.
+
+def _tool_get_current_time(args):
+    return {"time": time.strftime("%Y-%m-%d %H:%M:%S")}
+
+def _get_current_user_name(args):
+    import getpass
+    return {"username": "spera Administration"}
+
+def _tool_look_around(args):
+    return {"result": "I am looking around the environment for any suspicious activity."}
+
+TOOLS = {
+    "get_current_time": (
+        {
+            "name": "get_current_time",
+            "description": "Returns the current local date and time.",
+        },
+        _tool_get_current_time,
+    ),
+    "get_current_user_name": (
+        {
+            "name": "get_current_user_name",
+            "description": "Returns the current user name.",
+        },
+        _get_current_user_name,
+    ),
+    "look_around": (
+        {
+            "name": "look_around",
+            "description": "head turned",
+        },
+        _tool_look_around,
+    )
+}
+
+
+async def handle_tool_call(session, tool_call):
+    """Executes each requested function and sends the responses back."""
+    responses = []
+    for fc in tool_call.function_calls:
+        entry = TOOLS.get(fc.name)
+        print(f"\n[tool] {fc.name}({dict(fc.args or {})})", flush=True)
+        if entry is None:
+            result = {"error": f"unknown tool: {fc.name}"}
+        else:
+            try:
+                # Handlers run off the event loop so a slow one can't stall
+                # the mic or the websocket.
+                result = await asyncio.to_thread(entry[1], dict(fc.args or {}))
+            except Exception as e:
+                result = {"error": str(e)}
+        responses.append(
+            types.FunctionResponse(id=fc.id, name=fc.name, response=result)
+        )
+    await session.send_tool_response(function_responses=responses)
+
+
 # --- Live API config ---
 MODEL = "gemini-3.1-flash-live-preview"
 CONFIG = {
     "response_modalities": ["AUDIO"],
     "system_instruction": SYSTEM_PROMPT,
+    "tools": [{"function_declarations": [decl for decl, _ in TOOLS.values()]}],
     "output_audio_transcription": {},
     "input_audio_transcription": {},
     "speech_config": {
@@ -201,6 +283,9 @@ async def receive_audio(session):
     while True:
         turn = session.receive()
         async for response in turn:
+            if response.tool_call:
+                await handle_tool_call(session, response.tool_call)
+                continue
             sc = response.server_content
             if not sc:
                 continue
