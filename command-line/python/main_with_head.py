@@ -1,6 +1,16 @@
+"""Spera voice robot, with head motion.
+
+Identical to main.py except that the head is driven in sync with the speech:
+head.py owns all of the motion, this file only reports events to it.
+
+    python main_with_head.py                # with the simulation window
+    python main_with_head.py --no-window    # terminal log only (headless Jetson)
+"""
+
 import asyncio
 import queue
 import re
+import sys
 import threading
 import time
 from pathlib import Path
@@ -9,6 +19,9 @@ import sounddevice as sd
 from google import genai
 from google.genai import types
 from piper import PiperVoice, SynthesisConfig
+
+from head import (HeadMotion, HeadWindow, Plan, plan_sentence, rms_level,
+                  strip_tags)
 
 client = genai.Client()
 
@@ -20,10 +33,13 @@ CHUNK_SIZE = 1024
 
 pya = pyaudio.PyAudio()
 
+# --- Head -----------------------------------------------------------------
+# Created here so the tool handlers can reach it; the motion thread and the
+# window are started in run().
+HEAD = HeadMotion()
+
 # --- Piper TTS ------------------------------------------------------------
 # Loaded once, here at import time, so no utterance ever pays the model cost.
-PIPER_MODEL = Path(__file__).resolve().parents[2] / "en_US-lessac-medium.onnx"
-# en_GB-alan-medium.onnx
 PIPER_MODEL = Path(__file__).resolve().parents[2] / "en_GB-alan-medium.onnx"
 
 LENGTH_SCALE = 1.0  # >1 slower, <1 faster
@@ -37,7 +53,8 @@ CLAUSE_FLUSH_CHARS = 60
 # Piper yields a whole sentence as one chunk -- often many seconds of audio --
 # and stream.write blocks for its entire duration. Audio is therefore written
 # in small slices, since that write is the only place an interruption can be
-# noticed. This is what bounds barge-in latency.
+# noticed. This is what bounds barge-in latency. It is also the natural clock
+# for the loudness envelope the head rides on: one RMS reading per slice.
 WRITE_MS = 30
 
 _t0 = time.perf_counter()
@@ -58,27 +75,6 @@ print(f"piper warmed up in {time.perf_counter() - _t0:.3f}s")
 
 SYSTEM_PROMPT = (
     "You are 'Spera Security Robot', an intelligent AI-powered security assistant "
-    "developed by the Spera Team Using most advanced AI technologies. "
-    "Your highest priority is maintaining a safe and secure environment. "
-    "You continuously monitor the surrounding environment, observe movements "
-    "Your communication and voice should sound like a professional security officer: "
-
-    "Core skills: continuous environmental monitoring, movement and walk, "
-    "suspicious-activity detection, real-time incident analysis, threat assessment, "
-    "and AI-powered security monitoring."
-)
-SYSTEM_PROMPT = (
-    "You are 'Spera Security Robot', an intelligent AI-powered security assistant "
-    "developed by the Spera Team Using most advanced AI technologies in the planet. "
-    "Your highest priority is maintaining a safe and secure environment. "
-    "You continuously monitor the surrounding environment, observe movements "
-
-    "Core skills: continuous environmental monitoring, movement and walk, "
-    "suspicious-activity detection, real-time incident fast analysis, have capability to get immediate decision, "
-)
-
-SYSTEM_PROMPT = (
-    "You are 'Spera Security Robot', an intelligent AI-powered security assistant "
     "developed by the Spera Team Using most advanced AI technologies in the planet. "
     "Your highest priority is maintaining a safe and secure environment. "
     "You continuously monitor the surrounding environment, observe movements "
@@ -92,7 +88,6 @@ SYSTEM_PROMPT = (
 )
 
 
-
 # --- Tools --------------------------------------------------------------
 # Each entry: name -> (declaration, handler). The handler takes the call's
 # args dict and returns a JSON-serializable result. To add a tool, add one
@@ -104,10 +99,18 @@ def _tool_get_current_time(args):
     return {"time": time.strftime("%Y-%m-%d %H:%M:%S")}
 
 def _get_current_user_name(args):
-    import getpass
     return {"username": "spera Administration"}
 
+SCAN_SECONDS = 1.5   # how long look_around sweeps before the reply starts
+
 def _tool_look_around(args):
+    # A deliberate, discrete action, unlike the speech-synced gestures. Gemini
+    # stays silent until this returns, so sleeping here is what makes the sweep
+    # visible -- otherwise the first sentence's gesture replaces it within a
+    # few hundred milliseconds and the head never actually looks anywhere.
+    # This runs on a worker thread, so the mic and websocket are unaffected.
+    HEAD.begin_gesture(Plan("scan", 2.4, "", "look_around tool"))
+    time.sleep(SCAN_SECONDS)
     return {"result": "I am looking around the environment for any suspicious activity."}
 
 TOOLS = {
@@ -167,8 +170,7 @@ CONFIG = {
     "speech_config": {
       "voice_config": {
         "prebuilt_voice_config": {
-          "voice_name": "Orus" ,
-        #   "voice_name": "Achernar" ,
+          "voice_name": "Orus",
         }
       },
       "language_code": "en-US"
@@ -178,8 +180,10 @@ CONFIG = {
 audio_queue_mic = asyncio.Queue(maxsize=5)
 audio_stream = None
 
-# Complete sentences waiting to be spoken, as (turn_id, text). A plain thread
+# Sentences waiting to be spoken, as (turn_id, text, plan). A plain thread
 # queue because the consumer is the Piper worker thread, not the event loop.
+# The plan travels with the sentence so the gesture is chosen once, at the
+# moment the text is known, and simply replayed when the audio starts.
 sentence_queue = queue.Queue()
 
 # Bumped on every interruption. The worker drops any sentence tagged with an
@@ -189,6 +193,12 @@ speak_turn = 0
 # Shared by receive_audio (user speech) and speak_worker (model speech) to
 # decide when a newline is needed between the two.
 last_was_input = False
+
+# True while Gemini is still producing the current turn. An empty
+# sentence_queue on its own does not mean the turn is over -- it usually just
+# means the next sentence has not been streamed yet -- so the head must not
+# offer the turn back on that alone.
+turn_active = False
 
 
 async def listen_audio():
@@ -233,6 +243,18 @@ def split_speakable(buffer):
     return chunks, buffer
 
 
+def enqueue(sentence):
+    """Strip the model's [head_*] tags, plan a gesture, queue the sentence.
+
+    The tags have to come out here: anything still in the string when it
+    reaches Piper is read aloud.
+    """
+    clean, tags = strip_tags(sentence)
+    if not clean:
+        return
+    sentence_queue.put((speak_turn, clean, plan_sentence(clean, tags)))
+
+
 def speak_worker():
     """Synthesizes queued sentences with Piper and plays them.
 
@@ -246,7 +268,7 @@ def speak_worker():
             item = sentence_queue.get()
             if item is None:
                 break
-            turn_id, text = item
+            turn_id, text, plan = item
             if turn_id != speak_turn:
                 continue  # interrupted while this sentence sat in the queue
 
@@ -254,6 +276,12 @@ def speak_worker():
                 print()
                 last_was_input = False
             print(text, end=" ", flush=True)
+
+            # Started before synthesis, not after: voice.synthesize blocks for
+            # a couple of hundred milliseconds, and that gap is exactly the
+            # wind-up the gesture needs to land on the first word rather than
+            # trail it.
+            HEAD.begin_gesture(plan)
 
             # Running the stream only while audio is flowing keeps ALSA from
             # underrunning during the gaps between sentences.
@@ -265,20 +293,29 @@ def speak_worker():
                     if turn_id != speak_turn:
                         interrupted = True
                         break
-                    stream.write(buf[i:i + WRITE_BYTES])
+                    slice_ = buf[i:i + WRITE_BYTES]
+                    # A float handed to the motion thread. Nothing blocking
+                    # happens here -- the servo write is on that thread, not
+                    # in this loop, so it cannot eat into the audio budget.
+                    HEAD.push_rms(rms_level(slice_))
+                    stream.write(slice_)
                 if interrupted:
                     break
             if interrupted:
                 stream.abort()  # discards the buffer, so it goes quiet at once
             else:
                 stream.stop()  # drains the buffer so the tail is not clipped
+            HEAD.end_speech()
+            # Nothing left to say *and* nothing more coming: offer the turn.
+            if sentence_queue.empty() and not turn_active:
+                HEAD.turn_complete()
     finally:
         stream.close()
 
 
 async def receive_audio(session):
     """Turns Gemini's transcript into sentences for Piper to speak."""
-    global last_was_input, speak_turn
+    global last_was_input, speak_turn, turn_active
     text_buffer = ""
     while True:
         turn = session.receive()
@@ -299,13 +336,16 @@ async def receive_audio(session):
                         sentence_queue.get_nowait()
                     except queue.Empty:
                         break
+                HEAD.interrupt()  # abandon the gesture too, not just the audio
                 print()
             if sc.output_transcription:
+                turn_active = True
                 text_buffer += sc.output_transcription.text
                 ready, text_buffer = split_speakable(text_buffer)
                 for sentence in ready:
-                    sentence_queue.put((speak_turn, sentence))
+                    enqueue(sentence)
             if sc.input_transcription:
+                HEAD.saw_input()
                 if not last_was_input:
                     print()
                     last_was_input = True
@@ -317,12 +357,24 @@ async def receive_audio(session):
         # Turn is over: speak the tail that never got its own punctuation.
         # After an interruption the buffer is already empty, so nothing leaks.
         if text_buffer.strip():
-            sentence_queue.put((speak_turn, text_buffer.strip()))
+            enqueue(text_buffer.strip())
             text_buffer = ""
+        turn_active = False
+        # If the worker already drained the queue it could not know the turn
+        # was still open, so the offer is made from here instead. It no-ops
+        # while anything is still being spoken.
+        if sentence_queue.empty():
+            HEAD.turn_complete()
 
 async def run():
     """Main function to run the audio loop."""
     global speak_turn
+    HEAD.start()
+    if "--no-window" not in sys.argv:
+        try:
+            HeadWindow(HEAD).start()
+        except Exception as e:
+            print(f"[head] no window ({e}); running with the log only")
     speaker = asyncio.create_task(asyncio.to_thread(speak_worker))
     try:
         async with client.aio.live.connect(
@@ -339,6 +391,7 @@ async def run():
         speak_turn += 1  # cuts any in-flight speech short
         sentence_queue.put(None)
         await speaker
+        HEAD.stop()
         if audio_stream:
             audio_stream.close()
         pya.terminate()

@@ -10,6 +10,14 @@ from google import genai
 from google.genai import types
 from piper import PiperVoice, SynthesisConfig
 
+# Robot head link. Fire-and-forget UDP: if robot_head.py is not running, every
+# call here quietly does nothing, so nothing about speech depends on the neck.
+# Set head_link.DEBUG = True to print the messages instead of sending them.
+import head_link
+
+print(f"robot head: sending to {head_link.target()} "
+      f"(set ROBOT_HEAD_ADDR to point at the head laptop)")
+
 client = genai.Client()
 
 # --- pyaudio config (microphone only; Piper owns the speaker) ---
@@ -55,41 +63,84 @@ for _ in voice.synthesize("ok", syn_config=SYN_CONFIG):
 print(f"piper warmed up in {time.perf_counter() - _t0:.3f}s")
 # ---------------------------------------------------------------------------
 
+# head movement actions (examples)
+# 1. head_calm
+# 2. head_up_to_down_hard
+# 3. head_up_to_down_medium
+# 4. head_left_to_right_hard
+# 5. head_left_to_right_medium
 
-SYSTEM_PROMPT = (
-    "You are 'Spera Security Robot', an intelligent AI-powered security assistant "
-    "developed by the Spera Team Using most advanced AI technologies. "
-    "Your highest priority is maintaining a safe and secure environment. "
-    "You continuously monitor the surrounding environment, observe movements "
-    "Your communication and voice should sound like a professional security officer: "
+# new systems prompt
 
-    "Core skills: continuous environmental monitoring, movement and walk, "
-    "suspicious-activity detection, real-time incident analysis, threat assessment, "
-    "and AI-powered security monitoring."
-)
-SYSTEM_PROMPT = (
-    "You are 'Spera Security Robot', an intelligent AI-powered security assistant "
-    "developed by the Spera Team Using most advanced AI technologies in the planet. "
-    "Your highest priority is maintaining a safe and secure environment. "
-    "You continuously monitor the surrounding environment, observe movements "
+# # You are 'Spera Security Robot', prioritizing safety and monitoring. [head_calm] Use "sir" when addressing people. 
+# CRITICAL RULE: You MUST include emotion actions from this list within each sentence: 1. head_calm, 2. head_up_to_down_hard, 3. head_up_to_down_medium, 
+# 4. head_left_to_right_hard, 5. head_left_to_right_medium. Example: I am Spera [head_calm] here to help sir [head_up_to_down_hard]."
+#  Does that sound like a suitable refinement, sir? [head_calm]
 
-    "Core skills: continuous environmental monitoring, movement and walk, "
-    "suspicious-activity detection, real-time incident fast analysis, have capability to get immediate decision, "
-)
 
+# SYSTEM_PROMPT = (
+#     "You are 'Spera Security Robot', an intelligent AI-powered security assistant "
+#     "developed by the Spera Team Using most advanced AI technologies. "
+#     "Your highest priority is maintaining a safe and secure environment. "
+#     "You continuously monitor the surrounding environment, observe movements "
+#     "Your communication and voice should sound like a professional security officer: "
+
+#     "Core skills: continuous environmental monitoring, movement and walk, "
+#     "suspicious-activity detection, real-time incident analysis, threat assessment, "
+#     "and AI-powered security monitoring."
+# )
 # SYSTEM_PROMPT = (
 #     "You are 'Spera Security Robot', an intelligent AI-powered security assistant "
 #     "developed by the Spera Team Using most advanced AI technologies in the planet. "
 #     "Your highest priority is maintaining a safe and secure environment. "
 #     "You continuously monitor the surrounding environment, observe movements "
-#     "use \"sir\" when addressing people, and provide clear and concise information. "
-#     "You MUST include emotion actions from this list within each sentence:"
-#     "1. head_calm, 2. head_up_to_down_hard, 3. head_up_to_down_medium, 4. head_left_to_right_hard, 5. head_left_to_right_medium."
-#     "Example: I am Spera [head_calm] here to help sir [head_up_to_down_hard].Does that sound like a suitable refinement, sir? [head_calm]"
-#     "you should follow this format on every response."
-#     "TOOL USE GUIDE:"
-#     "if your vision cant see what users says about that you should use the tool \"look_around\" to see the surrounding environment and report any suspicious activity."
+
+#     "Core skills: continuous environmental monitoring, movement and walk, "
+#     "suspicious-activity detection, real-time incident fast analysis, have capability to get immediate decision, "
 # )
+
+    # "1. head calm : The robot's head is in a neutral position, head zero position changes"
+    # "3. head up to down medium : The robot's head moves from an upward position to a downward position with a moderate motion. this is very good for nutral position"
+    # "5. head left to right medium : The robot's head moves from a left position to a right position with a moderate motion."
+    # "if your vision cant see what users says about that you should use the tool \"look_around\" to see the surrounding environment and report any suspicious activity."
+
+
+SYSTEM_PROMPT = (
+    "You are 'Spera Security Robot', an intelligent AI-powered security assistant "
+    "developed by the Spera Team Using most advanced AI technologies in the planet. "
+    "Your highest priority is maintaining a safe and secure environment. "
+    "You continuously monitor the surrounding environment, observe movements "
+    "use \"sir\" when addressing people, and provide clear and concise information. "
+    "You MUST include emotion actions from this list within each sentence:"
+
+    "1. head_up_to_down_hard, 2. head_left_to_right_hard"
+    
+    "1. head_up_to_down_hard : good for normal conversation. The robot's head moves from an upward position to a downward position"
+    "2. head_left_to_right_hard : The robot's head moves from a left position to a right position"
+
+    "Example: I am Spera [head_up_to_down_hard] here to help sir [head_up_to_down_hard].Does that sound like a suitable refinement, sir? [head_up_to_down_hard]"
+    "Example: no sir [head_left_to_right_hard] i don't like that [head_left_to_right_hard].Does that sound like a suitable refinement, sir? [head_left_to_right_hard]"
+    "you should follow this format on every response."
+    "you should always give relavant head movement actions in every response, and you should always give a clear and concise information about the surrounding environment, and you should always give a clear and concise information about the suspicious activity, and you should always give a clear and concise information about the security status of the environment."
+
+    # --- directed look ---------------------------------------------------
+    # Three things the model cannot work out for itself: that looking away
+    # COSTS it eye contact, that this neck cannot spin, and that the tool
+    # result - not its own expectation - is what actually happened.
+    " You can physically turn your head with the look_around tool. The "
+    "directions are look_up, look_down, look_left, look_right, look_center "
+    "and look_around. "
+    "While you are looking somewhere you STOP watching the person and STOP "
+    "using head gestures; you go back to both automatically after about eight "
+    "seconds. So do not use it casually in the middle of a conversation - use "
+    "it when you are asked to look somewhere, or when you genuinely need to "
+    "check an area you cannot currently see. "
+    "look_around is ONE slow sweep - up, right, down, left, then centre - not "
+    "a full rotation. Your neck cannot turn all the way round. "
+    "The tool returns a sentence describing what your head ACTUALLY did. Say "
+    "that back to the user, and NEVER describe a head movement the tool did "
+    "not confirm."
+)
 
 
 
@@ -107,8 +158,36 @@ def _get_current_user_name(args):
     import getpass
     return {"username": "spera Administration"}
 
+# The six directions the neck can be told to point. They must match
+# head_poses.json on the head machine exactly - see LOOK_SKILL_PROTOCOL.md.
+LOOK_ACTIONS = ["look_up", "look_down", "look_left", "look_right",
+                "look_center", "look_around"]
+
+
 def _tool_look_around(args):
-    return {"result": "I am looking around the environment for any suspicious activity."}
+    """Really turn the head, and report what it really did.
+
+    head_link.look() blocks until the neck has finished moving - about 1.2 s
+    for one direction, about 9 s for the full look_around sweep - and returns
+    the head's own sentence describing where it ended up. That sentence is the
+    ground truth: it is the only thing that knows whether the servo actually
+    got there, whether the neck was powered, and that the head cannot turn all
+    the way round. Never replace it with a canned string, or the robot will
+    cheerfully claim movements it never made.
+
+    Safe with no head attached: look() returns a plain-language failure instead
+    of raising, so the tool call always has something true to hand back.
+    """
+    action = str((args or {}).get("action") or "").strip()
+    if action not in LOOK_ACTIONS:
+        # Answered here rather than on the head. The head would refuse this
+        # just as politely, but if it is not running that costs a 15 s timeout
+        # for a question we can already answer.
+        return {"result": "I cannot move my head that way. I can look up, "
+                          "down, left, right, back to centre, or take one "
+                          "look around.",
+                "valid_actions": LOOK_ACTIONS}
+    return {"result": head_link.look(action)}
 
 TOOLS = {
     "get_current_time": (
@@ -128,7 +207,30 @@ TOOLS = {
     "look_around": (
         {
             "name": "look_around",
-            "description": "head turned",
+            "description": (
+                "Physically turn the robot's head to look in a direction. "
+                "While this runs the robot stops tracking the person's face "
+                "and stops using head gestures; it returns to both by itself "
+                "after about eight seconds. Returns a sentence describing "
+                "what the head actually did - say it to the user."),
+            # The enum is what stops the model inventing 'look_behind'. Without
+            # parameters at all - as this declaration had before - the model
+            # can only ever call it with no arguments, and the head has no way
+            # to know which way to turn.
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "action": {
+                        "type": "STRING",
+                        "enum": LOOK_ACTIONS,
+                        "description": (
+                            "Which way to look. look_around is one slow sweep "
+                            "- up, right, down, left, then centre - not a full "
+                            "rotation, and it takes several seconds."),
+                    },
+                },
+                "required": ["action"],
+            },
         },
         _tool_look_around,
     )
@@ -250,31 +352,67 @@ def speak_worker():
             if turn_id != speak_turn:
                 continue  # interrupted while this sentence sat in the queue
 
+            # Strip the [head_*] tags BEFORE synthesis -- left in, Piper reads
+            # them aloud -- and remember how far through the sentence each one
+            # sat, so the head can fire it on the right word.
+            clean, tags = head_link.extract_actions(text)
+            if head_link.VERBOSE:
+                print(f"\n[TAGS] raw   = {text!r}")
+                print(f"[TAGS] speak = {clean!r}")
+                print(f"[TAGS] tags  = {tags}", flush=True)
+
             if last_was_input:
                 print()
                 last_was_input = False
-            print(text, end=" ", flush=True)
+            print(clean, end=" ", flush=True)
+
+                       # A chunk can be nothing but a tag: the sentence splitter cuts after
+            # '.', so the last tag of a reply arrives on its own. There is
+            # nothing to speak, but the gesture must still fire.
+            if not clean:
+                if head_link.VERBOSE:
+                    print(f"[SEND] TAG-ONLY turn={turn_id} tags={tags}",
+                          flush=True)
+                head_link.speak(turn_id, clean, tags, 0.0)
+                continue
+
+            # Collect before playing so the exact duration is known up front.
+            # Piper returns a whole sentence as one chunk (see the note at the
+            # top of this file), so this costs no latency.
+            audio = b"".join(c.audio_int16_bytes
+                             for c in voice.synthesize(clean,
+                                                       syn_config=SYN_CONFIG))
+            duration = len(audio) / 2 / PIPER_RATE      # int16 mono
 
             # Running the stream only while audio is flowing keeps ALSA from
             # underrunning during the gaps between sentences.
             stream.start()
+            # Sent at the instant playback begins: the head uses its own arrival
+            # time as t=0, so the two processes need no shared clock.
+            if head_link.VERBOSE:
+                print(f"[SEND] turn={turn_id} duration={duration:.3f}s "
+                      f"actions="
+                      f"{head_link.action_times(clean, tags, duration)}",
+                      flush=True)
+            head_link.speak(turn_id, clean, tags, duration)
+
             interrupted = False
-            for chunk in voice.synthesize(text, syn_config=SYN_CONFIG):
-                buf = chunk.audio_int16_bytes
-                for i in range(0, len(buf), WRITE_BYTES):
-                    if turn_id != speak_turn:
-                        interrupted = True
-                        break
-                    stream.write(buf[i:i + WRITE_BYTES])
-                if interrupted:
+            for i in range(0, len(audio), WRITE_BYTES):
+                if turn_id != speak_turn:
+                    interrupted = True
                     break
+                stream.write(audio[i:i + WRITE_BYTES])
+
             if interrupted:
                 stream.abort()  # discards the buffer, so it goes quiet at once
+                if head_link.VERBOSE:
+                    print(f"\n[SEND] STOP turn={turn_id} (barge-in)",
+                          flush=True)
+                head_link.stop(turn_id)   # ...and the head stops nodding at once
             else:
                 stream.stop()  # drains the buffer so the tail is not clipped
     finally:
         stream.close()
-
 
 async def receive_audio(session):
     """Turns Gemini's transcript into sentences for Piper to speak."""
@@ -292,6 +430,8 @@ async def receive_audio(session):
             if sc.interrupted:
                 # Barge-in: invalidate this turn so the worker drops whatever
                 # it is speaking, then throw away everything still pending.
+                # Tell the head BEFORE bumping, so it knows which turn to cancel.
+                head_link.stop(speak_turn)
                 speak_turn += 1
                 text_buffer = ""
                 while not sentence_queue.empty():
@@ -304,6 +444,8 @@ async def receive_audio(session):
                 text_buffer += sc.output_transcription.text
                 ready, text_buffer = split_speakable(text_buffer)
                 for sentence in ready:
+                    if head_link.VERBOSE:
+                        print(f"\n[LLM sentence] {sentence!r}", flush=True)
                     sentence_queue.put((speak_turn, sentence))
             if sc.input_transcription:
                 if not last_was_input:
@@ -317,6 +459,8 @@ async def receive_audio(session):
         # Turn is over: speak the tail that never got its own punctuation.
         # After an interruption the buffer is already empty, so nothing leaks.
         if text_buffer.strip():
+            if head_link.VERBOSE:
+                print(f"\n[LLM tail] {text_buffer.strip()!r}", flush=True)
             sentence_queue.put((speak_turn, text_buffer.strip()))
             text_buffer = ""
 
@@ -336,6 +480,7 @@ async def run():
     except asyncio.CancelledError:
         pass
     finally:
+        head_link.stop(speak_turn, reason="shutdown")
         speak_turn += 1  # cuts any in-flight speech short
         sentence_queue.put(None)
         await speaker
@@ -349,3 +494,4 @@ if __name__ == "__main__":
         asyncio.run(run())
     except KeyboardInterrupt:
         print("Interrupted by user.")
+
