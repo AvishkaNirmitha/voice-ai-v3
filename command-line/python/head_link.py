@@ -15,8 +15,11 @@ nothing - the voice AI never needs a code path for "no head attached".
     said = head_link.look("look_left")                  # from your tool call;
                                                         # blocks, returns text
 
-Everything here is fire-and-forget EXCEPT look(), which is a request and waits
-for the head's answer - see the long note on that function.
+    lim = head_link.limits()                            # blocks; None if no head
+    head_link.jog(yaw, pitch)                           # manual aiming, absolute
+
+Everything here is fire-and-forget EXCEPT look() and limits(), which are
+requests and wait for the head's answer - see the notes on those functions.
 
 Self-test:  python head_link.py
 """
@@ -25,6 +28,7 @@ import json
 import os
 import re
 import socket
+import threading
 import time
 import uuid
 
@@ -40,6 +44,12 @@ _HOST, _, _PORT = os.environ.get("ROBOT_HEAD_ADDR", "127.0.0.1:8770").partition(
 _ADDR = (_HOST or "127.0.0.1", int(_PORT or 8770))
 _sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 _seq = 0
+
+# send() is called from the audio thread (speak), the event loop (stop) and, in
+# head_manual.py, a slider thread at 25 Hz. They only ever contend for _seq and
+# the target address, so one short lock around building the datagram is enough;
+# sendto() itself does not need protecting.
+_lock = threading.Lock()
 
 # Identifies THIS run of the voice AI. `turn` numbers restart at 0 every time
 # this process starts, so without a session id a head that had already seen a
@@ -59,6 +69,14 @@ def target():
     """Where messages are being sent. Print this at startup - on a two-machine
     setup it is the single most useful thing to have in the log."""
     return f"{_ADDR[0]}:{_ADDR[1]}"
+
+
+def set_target(host, port):
+    """Point every subsequent message at a different head. Only head_manual.py
+    uses this - the voice AI reads ROBOT_HEAD_ADDR once and never moves."""
+    global _ADDR
+    with _lock:
+        _ADDR = (str(host), int(port))
 
 
 def session():
@@ -81,20 +99,22 @@ def send(repeat=1, **msg):
     idempotent on the head side, and `speak` is never repeated.
     """
     global _seq
-    _seq += 1
-    msg["v"] = 1
-    msg["sid"] = _SID
-    msg["seq"] = _seq
-    msg["sent"] = round(time.time(), 3)
+    with _lock:
+        _seq += 1
+        msg["v"] = 1
+        msg["sid"] = _SID
+        msg["seq"] = _seq
+        msg["sent"] = round(time.time(), 3)
+        addr = _ADDR
+        blob = json.dumps(msg).encode("utf-8")
     if DEBUG:
-        print(f"[head] {json.dumps(msg)}")
+        print(f"[head] {blob.decode()}")
         return
-    blob = json.dumps(msg).encode("utf-8")
     if VERBOSE:
-        print(f"[UDP OUT -> {_ADDR[0]}:{_ADDR[1]}] {blob.decode()}", flush=True)
+        print(f"[UDP OUT -> {addr[0]}:{addr[1]}] {blob.decode()}", flush=True)
     for _ in range(max(1, repeat)):
         try:
-            _sock.sendto(blob, _ADDR)
+            _sock.sendto(blob, addr)
         except OSError:
             return              # head not running; that is a normal state
 
@@ -265,6 +285,164 @@ def look(action, hold_s=None, timeout=15.0):
     finally:
         sock.close()
     return ("I could not tell whether my head moved - it did not answer me.")
+
+
+def jog(yaw, pitch):
+    """MANUAL CONTROL. Point the neck at an absolute angle, in degrees.
+
+        head_link.jog(-12.5, 4.0)      # yaw, pitch
+
+    yaw  + = the robot's RIGHT,  - = its left
+    pitch + = UP,                - = down
+    Both measured from the head's home position. Out-of-range values are
+    clamped by the head, so a slider can never demand an angle the neck does
+    not have - call limits() once to set the sliders' range properly.
+
+    Fire and forget, exactly like speak(): a slider being dragged sends tens of
+    packets a second and there is nothing useful to say back about any one of
+    them. Send at most ~20-30 per second; more is wasted, since the neck cannot
+    follow faster than that anyway.
+
+    While jog packets are arriving the head stops tracking faces and stops
+    gesturing. It hands itself back about 2 seconds after the last one - so
+    letting go of the slider needs no message, and there is no "I am finished"
+    packet whose loss could strand the head under manual control.
+    """
+    send(type="jog", yaw=round(float(yaw), 2), pitch=round(float(pitch), 2))
+
+
+def limits(timeout=2.0):
+    """Ask the head how far its neck actually travels. Call once, at startup.
+
+    Returns a dict:
+        {"yaw_min": -42.4, "yaw_max": 42.4,
+         "pitch_min": -24.9, "pitch_max": 33.7,
+         "yaw": 0.0, "pitch": 0.0}       # where it is right now
+
+    Use it to set the sliders' range. The numbers come from the servos' real
+    calibration, so they follow a re-homed or re-built neck; hardcoding them on
+    this side is how a slider ends up able to ask for an angle that does not
+    exist. Returns None if the head does not answer - fall back to a
+    conservative +/-30 and carry on.
+    """
+    rid = uuid.uuid4().hex[:8]
+    req = {"v": 1, "sid": _SID, "type": "limits", "id": rid}
+    if DEBUG:
+        print(f"[head] {json.dumps(req)}")
+        return None
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.settimeout(timeout)
+        sock.sendto(json.dumps(req).encode("utf-8"), _ADDR)
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            sock.settimeout(remaining)
+            data, _src = sock.recvfrom(8192)
+            try:
+                reply = json.loads(data.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if reply.get("type") == "limits_result":
+                if VERBOSE:
+                    print(f"[UDP IN  <- head] {data.decode('utf-8', 'replace')}",
+                          flush=True)
+                return reply
+    except (socket.timeout, OSError):
+        return None
+    finally:
+        sock.close()
+
+
+def jog(yaw, pitch):
+    """MANUAL AIMING. Point the neck at an absolute angle, in degrees.
+
+        yaw    + the robot's right,  - its left
+        pitch  + up,                 - down
+        zero   home, facing straight ahead
+
+    Absolute, never a step: send where the slider IS. Nothing comes back, on
+    purpose - a slider sends tens of these a second and there is nothing useful
+    to say about any one of them. A lost packet needs no recovery either,
+    because the next one 40 ms later carries the same absolute angle.
+
+    Out-of-range values are clamped by the head, not refused. That is a safety
+    net, not the plan: take the slider ranges from limits().
+
+    While jog packets are arriving the head stops tracking faces and stops
+    gesturing, and a directed look in progress is abandoned (its tool call gets
+    an honest "I stopped that move part way" rather than hanging).
+
+    THERE IS NO "FINISHED" MESSAGE, deliberately: about two seconds after the
+    last jog the head hands itself back to tracking and expression on its own.
+    So do not idle-repeat the last position to guard against packet loss - a
+    heartbeat would strand the head under manual control for as long as it ran.
+    Send while the value is moving, then go quiet.
+    """
+    send(type="jog", yaw=round(float(yaw), 2), pitch=round(float(pitch), 2))
+
+
+def limits(timeout=2.0):
+    """Ask the head for its real mechanical range. Blocks briefly.
+
+        {"yaw_min": -42.4, "yaw_max": 42.4,
+         "pitch_min": -24.9, "pitch_max": 33.7,
+         "yaw": 0.0, "pitch": 0.0}     <- and where the neck is right now
+
+    Returns None if the head does not answer, so callers fall back to a
+    conservative +/-30 / +/-20 and carry on.
+
+    Call this once at startup and use it for the slider ranges. Do NOT hardcode
+    the numbers: they come from the servos' real calibration, so they follow a
+    re-homed or rebuilt neck - and hardcoded ones quietly stop matching it.
+
+    Like look(), this uses its own socket: the reply comes back to whichever
+    socket sent the request, and the shared one is written from the audio
+    thread microseconds before playback starts.
+    """
+    global _seq
+    with _lock:
+        _seq += 1
+        rid = uuid.uuid4().hex[:8]
+        msg = {"v": 1, "sid": _SID, "seq": _seq, "type": "limits",
+               "id": rid, "sent": round(time.time(), 3)}
+        addr = _ADDR
+        blob = json.dumps(msg).encode("utf-8")
+
+    if DEBUG:
+        print(f"[head] {blob.decode()}")
+        return {"yaw_min": -30.0, "yaw_max": 30.0,
+                "pitch_min": -20.0, "pitch_max": 20.0, "yaw": 0.0, "pitch": 0.0}
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        if VERBOSE:
+            print(f"[UDP OUT -> {addr[0]}:{addr[1]}] {blob.decode()}", flush=True)
+        sock.sendto(blob, addr)
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sock.settimeout(remaining)
+            data, _src = sock.recvfrom(8192)
+            try:
+                reply = json.loads(data.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if reply.get("type") != "limits_result" or reply.get("id") != rid:
+                continue        # a stale reply to an abandoned earlier request
+            if VERBOSE:
+                print(f"[UDP IN  <- head] {data.decode('utf-8', 'replace')}",
+                      flush=True)
+            return reply
+    except (socket.timeout, OSError):
+        pass
+    finally:
+        sock.close()
+    return None
 
 
 def state(name):
