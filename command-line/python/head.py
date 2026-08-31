@@ -175,7 +175,7 @@ GESTURES = {
     "nod_hard":  (_g_nod_hard, 13.0, 1.7),
     "query":     (_g_query, 9.0, 0.0),
     "calm":      (_g_calm, 3.5, 0.7),
-    "scan":      (_g_scan, 32.0, 0.45),
+    "scan":      (_g_scan, 26.0, 0.45),
 }
 
 # The [head_*] tags the system prompt asks Gemini to emit, mapped onto the
@@ -270,7 +270,9 @@ def plan_sentence(text, tag_gestures=()):
 class HeadController:
     """Where the abstraction ends and the hardware begins."""
 
-    def write(self, pan, tilt):
+    def write(self, pan, tilt, active=True):
+        """Command a pose. `active` is False when the head has nothing to
+        express, which a hardware link may use to go quiet."""
         raise NotImplementedError
 
     def close(self):
@@ -284,7 +286,7 @@ class SimHeadController(HeadController):
         self.pan = 0.0
         self.tilt = 0.0
 
-    def write(self, pan, tilt):
+    def write(self, pan, tilt, active=True):
         self.pan = pan
         self.tilt = tilt
 
@@ -311,6 +313,13 @@ class HeadMotion:
     def __init__(self, controller=None, log=True):
         self.controller = controller or SimHeadController()
         self.log_enabled = log
+
+        # Travel, per axis. The module constants are only a default: a real
+        # neck reports its own calibration through head_link.limits(), which is
+        # asymmetric on real hardware, so min and max are tracked separately.
+        # set_limits() replaces these at startup when a head answers.
+        self.pan_min, self.pan_max = -PAN_LIMIT, PAN_LIMIT
+        self.tilt_min, self.tilt_max = -TILT_LIMIT, TILT_LIMIT
 
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -364,6 +373,16 @@ class HeadMotion:
                 self._last_input = time.monotonic()
         self._log(f"STATE {state:<9} base(pan {STATE_POSE[state].pan:+6.1f}, "
                   f"tilt {STATE_POSE[state].tilt:+6.1f})")
+
+    def set_limits(self, pan_min, pan_max, tilt_min, tilt_max):
+        """Adopt the neck's real travel. Anything the mixer produces is
+        clamped to this, so a gesture can never demand an angle the servos do
+        not have."""
+        with self._lock:
+            self.pan_min, self.pan_max = float(pan_min), float(pan_max)
+            self.tilt_min, self.tilt_max = float(tilt_min), float(tilt_max)
+        self._log(f"LIMITS pan {pan_min:+.1f}..{pan_max:+.1f}  "
+                  f"tilt {tilt_min:+.1f}..{tilt_max:+.1f}")
 
     def set_manual(self, on):
         with self._lock:
@@ -532,14 +551,20 @@ class HeadMotion:
         # Clamp to the mechanism, then limit how fast it may get there. Both
         # are pointless in simulation and essential the moment this drives a
         # real servo, which is exactly why they live here and not in main.
-        pan = max(-PAN_LIMIT, min(PAN_LIMIT, final.pan))
-        tilt = max(-TILT_LIMIT, min(TILT_LIMIT, final.tilt))
+        pan = max(self.pan_min, min(self.pan_max, final.pan))
+        tilt = max(self.tilt_min, min(self.tilt_max, final.tilt))
         step = MAX_SLEW / MOTION_HZ
         pan = self._prev_written.pan + max(-step, min(step, pan - self._prev_written.pan))
         tilt = self._prev_written.tilt + max(-step, min(step, tilt - self._prev_written.tilt))
         self._prev_written = Pose(pan, tilt)
 
-        self.controller.write(pan, tilt)
+        # `active` says whether the head is expressing anything right now.
+        # A hardware controller uses it to fall silent when it is not, which
+        # is what lets the real head hand itself back to face tracking; the
+        # simulator ignores it.
+        active = (manual or state != "idle" or gesture is not None
+                  or env > 0.02)
+        self.controller.write(pan, tilt, active)
 
         pending = getattr(self, "_log_pending", None)
         if pending:
@@ -689,8 +714,10 @@ class HeadWindow:
                                       self.motion.set_manual(False)), 8
             ).pack(side="left")
 
-        pan_s = slider(ctrl, "pan   - left / + right", -PAN_LIMIT, PAN_LIMIT)
-        tilt_s = slider(ctrl, "tilt  - down / + up", -TILT_LIMIT, TILT_LIMIT)
+        pan_s = slider(ctrl, "pan   - left / + right",
+                       self.motion.pan_min, self.motion.pan_max)
+        tilt_s = slider(ctrl, "tilt  - down / + up",
+                        self.motion.tilt_min, self.motion.tilt_max)
 
         row2 = tk.Frame(ctrl, bg=self.BG)
         row2.pack(fill="x", pady=(8, 0))

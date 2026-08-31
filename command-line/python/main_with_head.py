@@ -1,10 +1,16 @@
 """Spera voice robot, with head motion.
 
 Identical to main.py except that the head is driven in sync with the speech:
-head.py owns all of the motion, this file only reports events to it.
+head.py owns all of the motion, this file only reports events to it. The same
+pose stream drives the simulation window and, when one is reachable, the real
+neck over head_link -- so the window is a picture of what the hardware is
+doing, not a separate animation of it.
 
-    python main_with_head.py                # with the simulation window
-    python main_with_head.py --no-window    # terminal log only (headless Jetson)
+    python main_with_head.py                     # window + hardware if present
+    python main_with_head.py --no-window         # headless (Jetson)
+    python main_with_head.py --no-head           # simulation only
+    python main_with_head.py --head 192.168.1.159:8770
+    python main_with_head.py --verbose           # print every UDP datagram
 """
 
 import asyncio
@@ -34,9 +40,29 @@ CHUNK_SIZE = 1024
 pya = pyaudio.PyAudio()
 
 # --- Head -----------------------------------------------------------------
-# Created here so the tool handlers can reach it; the motion thread and the
-# window are started in run().
-HEAD = HeadMotion()
+# Created here so the tool handlers can reach it; the motion thread, the
+# window and the hardware handshake all happen in run().
+
+
+def _arg(flag, default=None):
+    return (sys.argv[sys.argv.index(flag) + 1]
+            if flag in sys.argv and sys.argv.index(flag) + 1 < len(sys.argv)
+            else default)
+
+
+HW = None               # RobotHeadController, or None for simulation only
+HEAD_PRESENT = False    # set in run() once the head answers limits()
+
+if "--no-head" not in sys.argv:
+    try:
+        import head_hw
+        import head_link
+        HW = head_hw.connect(_arg("--head"), verbose="--verbose" in sys.argv)
+    except Exception as e:
+        print(f"[head] no hardware link ({e}); simulation only")
+
+# One motion system, whichever controller it ended up with.
+HEAD = HeadMotion(controller=HW)
 
 # --- Piper TTS ------------------------------------------------------------
 # Loaded once, here at import time, so no utterance ever pays the model cost.
@@ -101,14 +127,24 @@ def _tool_get_current_time(args):
 def _get_current_user_name(args):
     return {"username": "spera Administration"}
 
-SCAN_SECONDS = 1.5   # how long look_around sweeps before the reply starts
+SCAN_SECONDS = 1.5   # simulated sweep, when there is no head to ask
 
 def _tool_look_around(args):
     # A deliberate, discrete action, unlike the speech-synced gestures. Gemini
-    # stays silent until this returns, so sleeping here is what makes the sweep
-    # visible -- otherwise the first sentence's gesture replaces it within a
-    # few hundred milliseconds and the head never actually looks anywhere.
+    # stays silent until this returns, so taking time here is what makes the
+    # sweep visible at all -- otherwise the first sentence's gesture replaces
+    # it within a few hundred milliseconds and the head never looks anywhere.
     # This runs on a worker thread, so the mic and websocket are unaffected.
+    if HEAD_PRESENT:
+        # The real head sweeps five stops and reports back what it saw; its
+        # own sentence is a better tool result than anything invented here.
+        # Jog is held off for the duration -- a jog packet mid-look abandons
+        # the look -- so the simulated sweep is stretched to roughly match.
+        HEAD.begin_gesture(Plan("scan", 8.0, "", "look_around tool"))
+        said = head_hw.directed_look(HW, "look_around")
+        HEAD.end_speech()
+        if said:
+            return {"result": said}
     HEAD.begin_gesture(Plan("scan", 2.4, "", "look_around tool"))
     time.sleep(SCAN_SECONDS)
     return {"result": "I am looking around the environment for any suspicious activity."}
@@ -368,8 +404,21 @@ async def receive_audio(session):
 
 async def run():
     """Main function to run the audio loop."""
-    global speak_turn
+    global speak_turn, HEAD_PRESENT
     HEAD.start()
+
+    # Ask the neck how far it actually travels before anything is drawn or
+    # driven: the sliders take their range from it, and the mixer clamps to it.
+    # limits() blocks for up to its timeout, hence the thread.
+    if HW is not None:
+        HEAD_PRESENT = await asyncio.to_thread(head_hw.apply_limits, HEAD)
+        if HEAD_PRESENT:
+            print(f"[head] hardware at {head_link.target()} - "
+                  f"travel read from the neck")
+        else:
+            print(f"[head] no answer from {head_link.target()} - "
+                  f"jogs still sent, conservative limits, look_around simulated")
+
     if "--no-window" not in sys.argv:
         try:
             HeadWindow(HEAD).start()
