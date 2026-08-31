@@ -50,6 +50,19 @@ SETTLE_S = 0.3
 FALLBACK = {"yaw_min": -30.0, "yaw_max": 30.0,
             "pitch_min": -20.0, "pitch_max": 20.0}
 
+# COMMANDED ANGLE IS NOT ACHIEVED ANGLE. The simulation has no inertia, so it
+# swings the full amplitude the mixer asks for. A real neck has mass and a
+# servo with its own speed ceiling, so it low-passes the gesture and arrives at
+# a fraction of it -- the faster the gesture, the smaller the fraction. The
+# wire therefore carries a pre-compensated command: the window keeps showing
+# the intended pose, and this scales it up so the neck actually gets there.
+#
+# This is calibration, not licence. The result is still clamped to the travel
+# the head itself reported, so gain can never drive a servo into its stop; too
+# much of it just flattens the tops of a gesture, which `clipped` counts.
+GAIN_PAN = 2.2
+GAIN_TILT = 2.2
+
 
 class RobotHeadController(SimHeadController):
     """Sends every resolved pose to the real head, and keeps it for the window.
@@ -58,16 +71,29 @@ class RobotHeadController(SimHeadController):
     the same numbers that go out on the wire.
     """
 
-    def __init__(self, send_hz=SEND_HZ, settle_s=SETTLE_S, release_idle=True):
+    def __init__(self, send_hz=SEND_HZ, settle_s=SETTLE_S, release_idle=True,
+                 gain_pan=GAIN_PAN, gain_tilt=GAIN_TILT):
         super().__init__()
         self._period = 1.0 / send_hz
         self._settle = settle_s
         self._release_idle = release_idle
+        self.gain_pan = float(gain_pan)
+        self.gain_tilt = float(gain_tilt)
+        # The neck's own travel, which bounds whatever the gain produces.
+        # Replaced by apply_limits() when the head answers.
+        self.pan_min, self.pan_max = FALLBACK["yaw_min"], FALLBACK["yaw_max"]
+        self.tilt_min, self.tilt_max = FALLBACK["pitch_min"], FALLBACK["pitch_max"]
         self._last_send = 0.0
         self._quiet_since = None
         self._suspend = 0
         self._lock = threading.Lock()
         self.sent = 0
+        self.clipped = 0        # frames the gain pushed past the neck's travel
+
+    def set_limits(self, pan_min, pan_max, tilt_min, tilt_max):
+        with self._lock:
+            self.pan_min, self.pan_max = float(pan_min), float(pan_max)
+            self.tilt_min, self.tilt_max = float(tilt_min), float(tilt_max)
 
     def write(self, pan, tilt, active=True):
         super().write(pan, tilt)        # the window reads these
@@ -85,7 +111,14 @@ class RobotHeadController(SimHeadController):
             return                      # silence: the head takes itself back
         self._last_send = now
         self.sent += 1
-        head_link.jog(pan, tilt)
+
+        # Amplify, then bound by the real neck. In that order: the clamp is the
+        # safety net and has to be the last thing that touches the number.
+        out_pan = max(self.pan_min, min(self.pan_max, pan * self.gain_pan))
+        out_tilt = max(self.tilt_min, min(self.tilt_max, tilt * self.gain_tilt))
+        if out_pan != pan * self.gain_pan or out_tilt != tilt * self.gain_tilt:
+            self.clipped += 1
+        head_link.jog(out_pan, out_tilt)
 
     @contextlib.contextmanager
     def suspended(self):
@@ -102,7 +135,7 @@ class RobotHeadController(SimHeadController):
             self._last_send = 0.0
 
 
-def connect(addr=None, verbose=False):
+def connect(addr=None, verbose=False, gain=None):
     """Point head_link at the head. Returns a controller, or None if disabled.
 
     Never raises and never blocks on the head being present: UDP sendto to a
@@ -115,10 +148,12 @@ def connect(addr=None, verbose=False):
     if addr:
         host, _, port = str(addr).partition(":")
         head_link.set_target(host or "127.0.0.1", int(port or 8770))
-    return RobotHeadController()
+    if gain is None:
+        return RobotHeadController()
+    return RobotHeadController(gain_pan=float(gain), gain_tilt=float(gain))
 
 
-def apply_limits(motion, timeout=2.0):
+def apply_limits(motion, controller=None, timeout=2.0):
     """Ask the head how far its neck really travels and clamp the mixer to it.
 
     Returns True if the head answered. When it does not, the conservative
@@ -130,6 +165,11 @@ def apply_limits(motion, timeout=2.0):
     lim = lim or FALLBACK
     motion.set_limits(lim["yaw_min"], lim["yaw_max"],
                       lim["pitch_min"], lim["pitch_max"])
+    if controller is not None:
+        # The controller needs them as well: it applies the gain *after* the
+        # mixer has already clamped, so it owns the last word on travel.
+        controller.set_limits(lim["yaw_min"], lim["yaw_max"],
+                              lim["pitch_min"], lim["pitch_max"])
     return known
 
 

@@ -11,6 +11,12 @@ doing, not a separate animation of it.
     python main_with_head.py --no-head           # simulation only
     python main_with_head.py --head 192.168.1.159:8770
     python main_with_head.py --verbose           # print every UDP datagram
+
+Two knobs exist for the gap between what the simulation shows and what a real
+neck achieves -- the sim has no inertia, the hardware does:
+
+    --gain 2.2          scale the angle sent to the neck (not the simulation)
+    --gesture-rate 0.7  slow every gesture down, so the neck can keep up
 """
 
 import asyncio
@@ -26,6 +32,7 @@ from google import genai
 from google.genai import types
 from piper import PiperVoice, SynthesisConfig
 
+import head
 from head import (HeadMotion, HeadWindow, Plan, plan_sentence, rms_level,
                   strip_tags)
 
@@ -57,7 +64,10 @@ if "--no-head" not in sys.argv:
     try:
         import head_hw
         import head_link
-        HW = head_hw.connect(_arg("--head"), verbose="--verbose" in sys.argv)
+        HW = head_hw.connect(_arg("--head"), verbose="--verbose" in sys.argv,
+                             gain=_arg("--gain"))
+        if _arg("--gesture-rate"):
+            head.GESTURE_RATE_SCALE = float(_arg("--gesture-rate"))
     except Exception as e:
         print(f"[head] no hardware link ({e}); simulation only")
 
@@ -411,7 +421,9 @@ async def run():
     # driven: the sliders take their range from it, and the mixer clamps to it.
     # limits() blocks for up to its timeout, hence the thread.
     if HW is not None:
-        HEAD_PRESENT = await asyncio.to_thread(head_hw.apply_limits, HEAD)
+        print(f"[head] output gain pan x{HW.gain_pan:.2f} tilt x{HW.gain_tilt:.2f}"
+              f"   gesture rate x{head.GESTURE_RATE_SCALE:.2f}")
+        HEAD_PRESENT = await asyncio.to_thread(head_hw.apply_limits, HEAD, HW)
         if HEAD_PRESENT:
             print(f"[head] hardware at {head_link.target()} - "
                   f"travel read from the neck")
@@ -440,6 +452,9 @@ async def run():
         speak_turn += 1  # cuts any in-flight speech short
         sentence_queue.put(None)
         await speaker
+        if HW is not None and HW.sent:
+            print(f"[head] {HW.sent} jogs sent, {HW.clipped} clipped at the "
+                  f"neck's travel ({100 * HW.clipped / HW.sent:.0f}%)")
         HEAD.stop()
         if audio_stream:
             audio_stream.close()

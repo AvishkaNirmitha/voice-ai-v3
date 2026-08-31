@@ -58,6 +58,13 @@ BREATH_DEG_BUSY = 0.4           # damped while listening or speaking
 POSE_EASE = 0.10                # per-frame approach rate toward the STATE pose
 CHARS_PER_SEC = 13.5            # rough speech rate, used to size a gesture
 
+# Scales every gesture's cycles-per-second. Below 1.0 the gestures slow down,
+# which matters on hardware and not at all in simulation: a neck with mass
+# achieves far more of the commanded amplitude at 1 Hz than at 2.2 Hz, so
+# slowing a gesture can make the real head move MORE, not less. Set from
+# main_with_head.py's --gesture-rate.
+GESTURE_RATE_SCALE = 1.0
+
 THINK_AFTER = 0.25              # silence before the "considering" pose engages
 YIELD_HOLD = 0.8                # how long the turn-yield lift is held
 GESTURE_RELEASE = 0.30          # fade-out when speech ends mid-gesture
@@ -410,7 +417,8 @@ class HeadMotion:
         if plan is None:
             return
         fn, amp, rate = GESTURES.get(plan.gesture, GESTURES["nod"])
-        cycles = max(1.0, rate * plan.duration) if rate else 1.0
+        cycles = (max(1.0, rate * GESTURE_RATE_SCALE * plan.duration)
+                  if rate else 1.0)
         with self._lock:
             self._speaking = True
             self._release = None
