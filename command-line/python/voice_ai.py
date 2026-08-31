@@ -1,7 +1,6 @@
 import asyncio
 import queue
 import re
-import threading
 import time
 from pathlib import Path
 import pyaudio
@@ -78,32 +77,38 @@ print(f"piper warmed up in {time.perf_counter() - _t0:.3f}s")
 #  Does that sound like a suitable refinement, sir? [head_calm]
 
 
-# SYSTEM_PROMPT = (
-#     "You are 'Spera Security Robot', an intelligent AI-powered security assistant "
-#     "developed by the Spera Team Using most advanced AI technologies. "
-#     "Your highest priority is maintaining a safe and secure environment. "
-#     "You continuously monitor the surrounding environment, observe movements "
-#     "Your communication and voice should sound like a professional security officer: "
+SYSTEM_PROMPT = (
+    "You are 'Spera Security Robot', an intelligent AI-powered security assistant "
+    "developed by the Spera Team Using most advanced AI technologies. "
+    "Your highest priority is maintaining a safe and secure environment. "
+    "You continuously monitor the surrounding environment, observe movements "
+    "Your communication and voice should sound like a professional security officer: "
 
-#     "Core skills: continuous environmental monitoring, movement and walk, "
-#     "suspicious-activity detection, real-time incident analysis, threat assessment, "
-#     "and AI-powered security monitoring."
-# )
-# SYSTEM_PROMPT = (
-#     "You are 'Spera Security Robot', an intelligent AI-powered security assistant "
-#     "developed by the Spera Team Using most advanced AI technologies in the planet. "
-#     "Your highest priority is maintaining a safe and secure environment. "
-#     "You continuously monitor the surrounding environment, observe movements "
+    "Core skills: continuous environmental monitoring, movement and walk, "
+    "suspicious-activity detection, real-time incident analysis, threat assessment, "
+    "and AI-powered security monitoring."
+)
 
-#     "Core skills: continuous environmental monitoring, movement and walk, "
-#     "suspicious-activity detection, real-time incident fast analysis, have capability to get immediate decision, "
-# )
+SYSTEM_PROMPT = (
+    "You are 'Spera Security Robot', an intelligent AI-powered security assistant "
+    "developed by the Spera Team Using most advanced AI technologies in the planet. "
+    "Your highest priority is maintaining a safe and secure environment. "
+    "You continuously monitor the surrounding environment, observe movements "
+    "use \"sir\" when addressing people, and provide clear and concise information. "
+    "use head movement actions to express emotions and reactions. "
+    "CRITCAL RULE - head movement actions (examples): "
+    "1. head_calm, "
+    "2. head_up_to_down_hard, "
+    "3. head_up_to_down_medium, "
+    "4. head_left_to_right_hard, "  
+    "5. head_left_to_right_medium, "
+    "examples - : I am Nuwan [head_calm] yes i [head_up_to_down_hard] have to go home [head_up_to_down_medium]. No i don't want [head_left_to_right_hard] milk rice [head_left_to_right_medium]"
+    "you should follow this format on every response. "
 
-    # "1. head calm : The robot's head is in a neutral position, head zero position changes"
-    # "3. head up to down medium : The robot's head moves from an upward position to a downward position with a moderate motion. this is very good for nutral position"
-    # "5. head left to right medium : The robot's head moves from a left position to a right position with a moderate motion."
-    # "if your vision cant see what users says about that you should use the tool \"look_around\" to see the surrounding environment and report any suspicious activity."
 
+    "Core skills: continuous environmental monitoring, movement and walk, "
+    "suspicious-activity detection, real-time incident fast analysis, have capability to get immediate decision, "
+)
 
 SYSTEM_PROMPT = (
     "You are 'Spera Security Robot', an intelligent AI-powered security assistant "
@@ -112,150 +117,63 @@ SYSTEM_PROMPT = (
     "You continuously monitor the surrounding environment, observe movements "
     "use \"sir\" when addressing people, and provide clear and concise information. "
     "You MUST include emotion actions from this list within each sentence:"
-
-    "1. head_up_to_down_hard, 2. head_left_to_right_hard"
-    
-    "1. head_up_to_down_hard : good for normal conversation. The robot's head moves from an upward position to a downward position"
-    "2. head_left_to_right_hard : The robot's head moves from a left position to a right position"
-
-    "Example: I am Spera [head_up_to_down_hard] here to help sir [head_up_to_down_hard].Does that sound like a suitable refinement, sir? [head_up_to_down_hard]"
-    "Example: no sir [head_left_to_right_hard] i don't like that [head_left_to_right_hard].Does that sound like a suitable refinement, sir? [head_left_to_right_hard]"
+    "1. head_calm, 2. head_up_to_down_hard, 3. head_up_to_down_medium, 4. head_left_to_right_hard, 5. head_left_to_right_medium."
+    "Example: I am Spera [head_calm] here to help sir [head_up_to_down_hard].Does that sound like a suitable refinement, sir? [head_calm]"
     "you should follow this format on every response."
-    "you should always give relavant head movement actions in every response, and you should always give a clear and concise information about the surrounding environment, and you should always give a clear and concise information about the suspicious activity, and you should always give a clear and concise information about the security status of the environment."
 
-    # --- directed look ---------------------------------------------------
-    # Three things the model cannot work out for itself: that looking away
-    # COSTS it eye contact, that this neck cannot spin, and that the tool
-    # result - not its own expectation - is what actually happened.
-    " You can physically turn your head with the look_around tool. The "
-    "directions are look_up, look_down, look_left, look_right, look_center "
-    "and look_around. "
-    "While you are looking somewhere you STOP watching the person and STOP "
-    "using head gestures; you go back to both automatically after about eight "
-    "seconds. So do not use it casually in the middle of a conversation - use "
-    "it when you are asked to look somewhere, or when you genuinely need to "
-    "check an area you cannot currently see. "
-    "look_around is ONE slow sweep - up, right, down, left, then centre - not "
-    "a full rotation. Your neck cannot turn all the way round. "
+    # --- directed look --------------------------------------------------
+    # The model has to be told three things it cannot work out for itself:
+    # that looking away COSTS it eye contact, that the neck cannot spin, and
+    # that the tool result is the ground truth about what the body did.
+    " You can physically turn your head using the look_around tool: "
+    "look_up, look_down, look_left, look_right, look_center, look_around. "
+    "While you are looking somewhere you STOP making eye contact and STOP "
+    "using head gestures; you return to both automatically after about eight "
+    "seconds. look_around is ONE slow sweep - up, right, down, left, centre - "
+    "not a full rotation, and it takes several seconds. "
+    "Use it when asked to look somewhere, or when there is a real reason to "
+    "look away - not casually mid-conversation, because you cannot watch the "
+    "person while you do it. "
     "The tool returns a sentence describing what your head ACTUALLY did. Say "
-    "that back to the user, and NEVER describe a head movement the tool did "
-    "not confirm."
+    "that back to the user. NEVER describe a head movement the tool did not "
+    "confirm."
 )
 
 
-
-# --- Tools --------------------------------------------------------------
-# Each entry: name -> (declaration, handler). The handler takes the call's
-# args dict and returns a JSON-serializable result. To add a tool, add one
-# entry here; the declaration and dispatch are derived from this registry.
-# Gemini 3.1 Flash Live supports synchronous function calling only: the model
-# stays silent until send_tool_response is called, so keep handlers fast.
-
-def _tool_get_current_time(args):
-    return {"time": time.strftime("%Y-%m-%d %H:%M:%S")}
-
-def _get_current_user_name(args):
-    import getpass
-    return {"username": "spera Administration"}
-
-# The six directions the neck can be told to point. They must match
-# head_poses.json on the head machine exactly - see LOOK_SKILL_PROTOCOL.md.
+# --- Tool: directed look ------------------------------------------------------
+# The only tool the head exposes. All six directions go through the one
+# function; the names must match head_poses.json on the head machine exactly
+# (LOOK_SKILL_PROTOCOL.md section 3). An enum is what stops the model from
+# inventing "look_behind".
 LOOK_ACTIONS = ["look_up", "look_down", "look_left", "look_right",
                 "look_center", "look_around"]
 
-
-def _tool_look_around(args):
-    """Really turn the head, and report what it really did.
-
-    head_link.look() blocks until the neck has finished moving - about 1.2 s
-    for one direction, about 9 s for the full look_around sweep - and returns
-    the head's own sentence describing where it ended up. That sentence is the
-    ground truth: it is the only thing that knows whether the servo actually
-    got there, whether the neck was powered, and that the head cannot turn all
-    the way round. Never replace it with a canned string, or the robot will
-    cheerfully claim movements it never made.
-
-    Safe with no head attached: look() returns a plain-language failure instead
-    of raising, so the tool call always has something true to hand back.
-    """
-    action = str((args or {}).get("action") or "").strip()
-    if action not in LOOK_ACTIONS:
-        # Answered here rather than on the head. The head would refuse this
-        # just as politely, but if it is not running that costs a 15 s timeout
-        # for a question we can already answer.
-        return {"result": "I cannot move my head that way. I can look up, "
-                          "down, left, right, back to centre, or take one "
-                          "look around.",
-                "valid_actions": LOOK_ACTIONS}
-    return {"result": head_link.look(action)}
-
-TOOLS = {
-    "get_current_time": (
-        {
-            "name": "get_current_time",
-            "description": "Returns the current local date and time.",
-        },
-        _tool_get_current_time,
-    ),
-    "get_current_user_name": (
-        {
-            "name": "get_current_user_name",
-            "description": "Returns the current user name.",
-        },
-        _get_current_user_name,
-    ),
-    "look_around": (
-        {
-            "name": "look_around",
-            "description": (
-                "Physically turn the robot's head to look in a direction. "
-                "While this runs the robot stops tracking the person's face "
-                "and stops using head gestures; it returns to both by itself "
-                "after about eight seconds. Returns a sentence describing "
-                "what the head actually did - say it to the user."),
-            # The enum is what stops the model inventing 'look_behind'. Without
-            # parameters at all - as this declaration had before - the model
-            # can only ever call it with no arguments, and the head has no way
-            # to know which way to turn.
-            "parameters": {
-                "type": "OBJECT",
-                "properties": {
-                    "action": {
-                        "type": "STRING",
-                        "enum": LOOK_ACTIONS,
-                        "description": (
-                            "Which way to look. look_around is one slow sweep "
-                            "- up, right, down, left, then centre - not a full "
-                            "rotation, and it takes several seconds."),
-                    },
+LOOK_TOOL = {
+    "function_declarations": [{
+        "name": "look_around",
+        "description": (
+            "Physically turn the robot's head to look in a direction. While "
+            "this runs the robot stops tracking the person's face and stops "
+            "gesturing, then resumes both by itself after about eight "
+            "seconds. Returns a sentence describing what the head actually "
+            "did - say it to the user."),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {
+                    "type": "STRING",
+                    "enum": LOOK_ACTIONS,
+                    "description": (
+                        "Which way to look. look_around is one slow sweep "
+                        "(up, right, down, left, centre), not a full "
+                        "rotation."),
                 },
-                "required": ["action"],
             },
+            "required": ["action"],
         },
-        _tool_look_around,
-    )
+    }]
 }
 
-
-async def handle_tool_call(session, tool_call):
-    """Executes each requested function and sends the responses back."""
-    responses = []
-    for fc in tool_call.function_calls:
-        entry = TOOLS.get(fc.name)
-        print(f"\n[tool] {fc.name}({dict(fc.args or {})})", flush=True)
-        if entry is None:
-            result = {"error": f"unknown tool: {fc.name}"}
-        else:
-            try:
-                # Handlers run off the event loop so a slow one can't stall
-                # the mic or the websocket.
-                result = await asyncio.to_thread(entry[1], dict(fc.args or {}))
-            except Exception as e:
-                result = {"error": str(e)}
-        responses.append(
-            types.FunctionResponse(id=fc.id, name=fc.name, response=result)
-        )
-    await session.send_tool_response(function_responses=responses)
 
 
 # --- Live API config ---
@@ -263,7 +181,7 @@ MODEL = "gemini-3.1-flash-live-preview"
 CONFIG = {
     "response_modalities": ["AUDIO"],
     "system_instruction": SYSTEM_PROMPT,
-    "tools": [{"function_declarations": [decl for decl, _ in TOOLS.values()]}],
+    "tools": [LOOK_TOOL],
     "output_audio_transcription": {},
     "input_audio_transcription": {},
     "speech_config": {
@@ -366,7 +284,7 @@ def speak_worker():
                 last_was_input = False
             print(clean, end=" ", flush=True)
 
-                       # A chunk can be nothing but a tag: the sentence splitter cuts after
+            # A chunk can be nothing but a tag: the sentence splitter cuts after
             # '.', so the last tag of a reply arrives on its own. There is
             # nothing to speak, but the gesture must still fire.
             if not clean:
@@ -414,6 +332,36 @@ def speak_worker():
     finally:
         stream.close()
 
+
+async def handle_tool_call(session, tool_call):
+    """Run the head tool and send the result back to Gemini.
+
+    THE THREAD MATTERS. head_link.look() blocks until the head has finished
+    moving - about 1.2 s for one pose and about 9 s for look_around. Called
+    directly here it would block the event loop, which is also what drains
+    audio_queue_mic; the mic queue (maxsize=5) would fill, listen_audio would
+    stall, and the model would receive several seconds of silence in the middle
+    of a conversation. asyncio.to_thread keeps the audio flowing while the neck
+    moves. The `await` still pauses THIS turn, which is correct: Gemini is
+    waiting on the result and will send nothing else until it has one.
+
+    Every call answers. A tool call left unanswered hangs the session, so even
+    an unknown function name gets a result rather than silence.
+    """
+    responses = []
+    for fc in tool_call.function_calls:
+        if fc.name == "look_around":
+            action = (fc.args or {}).get("action", "")
+            print(f"\n[tool] look_around({action!r}) ...", flush=True)
+            said = await asyncio.to_thread(head_link.look, action)
+            print(f"[tool] -> {said!r}", flush=True)
+        else:
+            said = f"I do not have a tool called {fc.name}."
+        responses.append(types.FunctionResponse(
+            id=fc.id, name=fc.name, response={"result": said}))
+    await session.send_tool_response(function_responses=responses)
+
+
 async def receive_audio(session):
     """Turns Gemini's transcript into sentences for Piper to speak."""
     global last_was_input, speak_turn
@@ -421,6 +369,10 @@ async def receive_audio(session):
     while True:
         turn = session.receive()
         async for response in turn:
+            # BEFORE the server_content check. A tool call arrives with
+            # server_content EMPTY, so `if not sc: continue` swallows it and
+            # the model then waits forever for a result that never comes -
+            # which looks exactly like the model deciding not to use the tool.
             if response.tool_call:
                 await handle_tool_call(session, response.tool_call)
                 continue
@@ -494,4 +446,3 @@ if __name__ == "__main__":
         asyncio.run(run())
     except KeyboardInterrupt:
         print("Interrupted by user.")
-
