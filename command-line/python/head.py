@@ -58,6 +58,13 @@ BREATH_DEG_BUSY = 0.4           # damped while listening or speaking
 POSE_EASE = 0.10                # per-frame approach rate toward the STATE pose
 CHARS_PER_SEC = 13.5            # rough speech rate, used to size a gesture
 
+# Scales every gesture's cycles-per-second. Below 1.0 the gestures slow down,
+# which matters on hardware and not at all in simulation: a neck with mass
+# achieves far more of the commanded amplitude at 1 Hz than at 2.2 Hz, so
+# slowing a gesture can make the real head move MORE, not less. Set from
+# main_with_head.py's --gesture-rate.
+GESTURE_RATE_SCALE = 1.0
+
 THINK_AFTER = 0.25              # silence before the "considering" pose engages
 YIELD_HOLD = 0.8                # how long the turn-yield lift is held
 GESTURE_RELEASE = 0.30          # fade-out when speech ends mid-gesture
@@ -170,26 +177,49 @@ def _g_scan(u, amp, cycles):
 
 # name -> (function, amplitude in degrees, cycles per second)
 GESTURES = {
-    "shake":     (_g_shake, 16.0, 2.2),
+    "shake":     (_g_shake, 18.0, 1),
     "nod":       (_g_nod, 9.0, 1.5),
     "nod_hard":  (_g_nod_hard, 13.0, 1.7),
     "query":     (_g_query, 9.0, 0.0),
-    "calm":      (_g_calm, 3.5, 0.7),
+    # The commonest tag by far in real use, so it cannot be the near-invisible
+    # one: a person speaking neutrally still moves their head. Gentler and
+    # slower than a nod, and it rides around neutral rather than dipping below
+    # it, so the two stay distinguishable.
+    "calm":      (_g_calm, 6.0, 0.8),
     "scan":      (_g_scan, 26.0, 0.45),
 }
 
-# The [head_*] tags the system prompt asks Gemini to emit, mapped onto the
-# gesture library. Anything the model invents that is not here falls back to
-# the text heuristics in plan_sentence().
+# INTENT TAGS. The prompt asks Gemini to open every sentence with exactly one
+# of these. It is a classification task with four obvious answers, which the
+# model is good at -- unlike the earlier scheme, which asked it to sprinkle
+# "emotion actions" through a sentence and got decoration placed at random.
+# Reading the label is also language-independent, where the keyword ladder
+# below is English-only and tied to this robot's vocabulary.
+INTENT_GESTURE = {
+    "deny": "shake",
+    "affirm": "nod",
+    "ask": "query",
+    "neutral": "calm",
+}
+
+# The older [head_*] vocabulary, still accepted so an unchanged prompt (main.py
+# still carries one) keeps working.
 TAG_GESTURE = {
     "head_calm": "calm",
     "head_up_to_down_hard": "nod_hard",
     "head_up_to_down_medium": "nod",
     "head_left_to_right_hard": "shake",
     "head_left_to_right_medium": "shake",
+    **INTENT_GESTURE,
 }
 
-TAG_RE = re.compile(r"\[\s*(head_[a-z_]+)\s*\]", re.I)
+TAG_RE = re.compile(
+    r"\[\s*(head_[a-z_]+|deny|affirm|ask|neutral)\s*\]", re.I)
+
+# Every sentence where the model's tag and the keyword ladder disagreed, as
+# (text, tagged, heuristic). This is the only honest way to find out which one
+# is actually right: print it after a real session and read the rows.
+TAG_DISAGREEMENTS = []
 
 
 def strip_tags(text):
@@ -207,13 +237,81 @@ def strip_tags(text):
 NEGATIONS = ("no", "not", "negative", "never", "nothing", "none",
              "denied", "unauthorized", "unable", "cannot", "sorry")
 
-# Negations of the main clause, which a sentence-initial check misses entirely:
-# "I am not able to fly" and "I cannot access that floor" are both refusals and
-# should shake, even though they open with "I".
-NEGATION_PHRASES = ("do not", "does not", "did not", "cannot", "can not",
-                    "am not", "is not", "are not", "was not", "will not",
-                    "unable", "not able", "not within", "not permitted",
-                    "no longer", "never")
+# REFUSAL, not merely negation -- the fallback used when the model gives no
+# intent tag. The distinction matters in this robot's vocabulary: "I have
+# detected no movement" and "I don't see any threats" are reassurances,
+# grammatically negative but pragmatically good news, and shaking the head
+# through them tells the user the opposite of the sentence. What earns a shake
+# is the robot negating its own capability or permission.
+#
+# Contractions are expanded first. Gemini contracts constantly, and a list of
+# expanded forms matches none of them, which silently turned every contracted
+# refusal into a nod.
+_CONTRACTIONS = ((r"\bwon't\b", "will not"), (r"\bcan't\b", "cannot"),
+                 (r"\bshan't\b", "shall not"), (r"n't\b", " not"))
+
+# Explicit inability: the robot flatly cannot or may not. Strong enough to
+# overrule a [neutral] tag, and strong enough to keep a shake on a clause that
+# inherited its [deny] from the sentence it belongs to.
+REFUSALS_STRONG = ("cannot", "can not", "not able", "unable", "will not",
+                   "not permitted", "not allowed", "not authorised",
+                   "not authorized", "not cleared", "forbidden", "prohibited",
+                   "denied", "unauthorised", "unauthorized", "impossible",
+                   "prevents me", "prevent me", "prohibits me", "not allow",
+                   "do not possess", "does not possess", "not possess",
+                   "not capable", "do not have the", "does not have the")
+
+# Descriptive limitation: true, and often the reason behind a refusal, but not
+# itself a "no". "My mobility is restricted to the ground" states a design
+# fact; the model calling that [neutral] is reasonable and must not be
+# overruled. These still shake when nothing else is available, but they never
+# outrank the model.
+REFUSALS_SOFT = ("restricted", "confined to", "beyond my", "outside my",
+                 "lack the", "lacks the", "not within")
+
+# Reports of absence: negated, but good news.
+ABSENCE = ("not see", "not detect", "not observe", "not find", "not notice",
+           "not hear", "no movement", "no threat", "no sign", "no activity",
+           "no issue", "no problem", "nothing suspicious", "nothing unusual",
+           "nothing out of")
+
+# Negation words doing the opposite job -- emphasis, not denial.
+ANTI_NEGATION = ("not only", "cannot stress", "no doubt", "nothing but",
+                 "nonetheless", "could not be better", "could not agree")
+
+
+def expand_contractions(text):
+    for pat, rep in _CONTRACTIONS:
+        text = re.sub(pat, rep, text, flags=re.I)
+    return text
+
+
+def is_absence(lowered):
+    """True for a report that something was NOT found -- good news, not a
+    refusal. "Nothing suspicious to report" opens with a negation word and is
+    still reassurance, so this gates the sentence-initial test too."""
+    return any(p in expand_contractions(lowered) for p in ABSENCE)
+
+
+def _negatable(lowered):
+    text = expand_contractions(lowered)
+    if any(p in text for p in ANTI_NEGATION) or is_absence(lowered):
+        return None
+    return text
+
+
+def is_refusal(lowered):
+    """True for an explicit "I cannot / may not". Deliberately narrow: what
+    this misses becomes a nod, a mild error; what it wrongly catches has the
+    robot shaking its head through reassurance, which is a loud one."""
+    text = _negatable(lowered)
+    return bool(text) and any(p in text for p in REFUSALS_STRONG)
+
+
+def is_limitation(lowered):
+    """True for a stated limit that is not itself a refusal."""
+    text = _negatable(lowered)
+    return bool(text) and any(p in text for p in REFUSALS_SOFT)
 
 
 @dataclass
@@ -225,44 +323,94 @@ class Plan:
     reason: str
 
 
-def plan_sentence(text, tag_gestures=()):
-    """Choose a gesture for a sentence. Called when the text is known, which
-    is up to a few hundred ms before Piper starts playing it -- that lead is
-    what lets a gesture wind up *with* the first word instead of after it.
+def _by_text(stripped, duration):
+    """The keyword ladder: what the sentence looks like, in English.
 
-    A [head_*] tag the model placed in this sentence wins; the heuristics below
-    are the fallback for when it ignores the instruction, which it will.
+    Used when the model gave no intent tag, and computed even when it did, so
+    the two can be compared -- see TAG_DISAGREEMENTS.
     """
-    stripped = text.strip()
-    duration = max(0.5, min(len(stripped) / CHARS_PER_SEC, 9.0))
-
     lowered = stripped.lower()
     first = lowered.lstrip("\"'([").split(" ")[0].strip(".,!?;:")
 
-    # What the sentence plainly *is* outranks whatever the model tagged it.
-    # Gemini places these tags to satisfy the prompt rather than to mean
-    # anything -- observed tagging questions as shakes and refusals as calm --
-    # so an unambiguous syntactic signal wins and the tag is only consulted
-    # when the text itself gives nothing to go on.
     if stripped.endswith("?"):
         return Plan("query", duration, stripped, "question")
     if stripped.endswith("!"):
         return Plan("nod_hard", duration, stripped, "exclamation")
-    if first in NEGATIONS:
+    # A bare "No, sir." is a refusal by itself; anything longer has to earn it.
+    if (first in NEGATIONS and not is_absence(lowered)
+            and not any(p in lowered for p in ANTI_NEGATION)):
         return Plan("shake", duration, stripped, f"opens '{first}'")
-    if any(ph in lowered for ph in NEGATION_PHRASES):
-        return Plan("shake", duration, stripped, "negated clause")
-
-    # A shake means "no". The text was checked for negation just above and had
-    # none, so a shake tag here contradicts the sentence it sits in -- drop it
-    # rather than have the robot deny its own statement.
-    usable = [g for g in tag_gestures if g != "shake"]
-    if usable:
-        return Plan(usable[0], duration, stripped, "model tag")
-
+    if is_refusal(lowered):
+        return Plan("shake", duration, stripped, "refusal")
+    if is_limitation(lowered):
+        return Plan("shake", duration, stripped, "limitation")
     if len(stripped) < 18:
         return Plan("calm", duration, stripped, "short phrase")
     return Plan("nod", duration, stripped, "declarative")
+
+
+# Verdicts the keyword ladder reached from a definite signal in the text, as
+# opposed to its two fall-throughs ("declarative", "short phrase") which are
+# just defaults for "nothing stood out".
+def _is_definite(plan):
+    return plan.reason in ("question", "exclamation", "refusal") \
+        or plan.reason.startswith("opens ")
+
+
+def plan_sentence(text, tag_gestures=(), inherited=False):
+    """Choose a gesture for a sentence. Called when the text is known, which
+    is up to a few hundred ms before Piper starts playing it -- that lead is
+    what lets a gesture wind up *with* the first word instead of after it.
+
+    The model's intent tag wins when there is one. Asking for one label per
+    sentence from a four-word vocabulary is a classification the model can do,
+    and it reads the meaning rather than the words -- so it survives phrasing
+    the ladder below has never seen, and languages it was never written for.
+    The ladder is the fallback for when the model forgets, which it will.
+    """
+    stripped = text.strip()
+    duration = max(0.5, min(len(stripped) / CHARS_PER_SEC, 9.0))
+
+    fallback = _by_text(stripped, duration)
+    if not tag_gestures:
+        return fallback
+
+    tag = tag_gestures[0]
+
+    # An inherited [deny] on a trailing clause. The model tags whole sentences
+    # but split_speakable cuts at commas, so "[deny] I am not capable of
+    # flight, sir, / as I operate on the ground." hands the second fragment a
+    # refusal it does not contain -- and the head keeps shaking through the
+    # explanation. A person shakes once, on the refusal, then talks normally
+    # through the reason.
+    #
+    # Only softened when the fragment itself says nothing definite. "but I am
+    # not able to physically interact with objects" inherits a [deny] and IS a
+    # refusal, so it keeps the shake.
+    if inherited and tag == "shake" and not _is_definite(fallback):
+        fallback.reason = f"{fallback.reason} (after [deny])"
+        return fallback
+
+    # [neutral] is the prompt's catch-all, so it is what the model reaches for
+    # when it has not really decided -- in a real session it came back on plain
+    # questions and on outright refusals alike, 12 sentences out of 19. The
+    # other three tags are decisions the model actually committed to, and those
+    # have been right every time. So a committed tag outranks the text, and a
+    # neutral one only outranks it where the text found nothing definite
+    # either.
+    if tag == "calm" and _is_definite(fallback):
+        TAG_DISAGREEMENTS.append((stripped, tag, fallback.gesture))
+        fallback.reason = f"{fallback.reason} (beat [neutral])"
+        return fallback
+
+    plan = Plan(tag, duration, stripped, "intent tag")
+    if plan.gesture != fallback.gesture:
+        # Recorded rather than resolved. Which source is right is a question
+        # about the model, and the only way to answer it is to run a session
+        # and read these rows.
+        TAG_DISAGREEMENTS.append((stripped, plan.gesture, fallback.gesture))
+        plan.reason = f"intent tag (text said {fallback.gesture})"
+    return plan
 
 
 # --- controllers ----------------------------------------------------------
@@ -410,7 +558,8 @@ class HeadMotion:
         if plan is None:
             return
         fn, amp, rate = GESTURES.get(plan.gesture, GESTURES["nod"])
-        cycles = max(1.0, rate * plan.duration) if rate else 1.0
+        cycles = (max(1.0, rate * GESTURE_RATE_SCALE * plan.duration)
+                  if rate else 1.0)
         with self._lock:
             self._speaking = True
             self._release = None

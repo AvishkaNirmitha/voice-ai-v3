@@ -11,6 +11,15 @@ doing, not a separate animation of it.
     python main_with_head.py --no-head           # simulation only
     python main_with_head.py --head 192.168.1.159:8770
     python main_with_head.py --verbose           # print every UDP datagram
+    python main_with_head.py --llm-print         # Gemini's raw text, tags and all
+    python main_with_head.py --blocking-look     # let the head run its own
+                                                 # 9s sweep (silences the reply)
+
+Two knobs exist for the gap between what the simulation shows and what a real
+neck achieves -- the sim has no inertia, the hardware does:
+
+    --gain 2.2          scale the angle sent to the neck (not the simulation)
+    --gesture-rate 0.7  slow every gesture down, so the neck can keep up
 """
 
 import asyncio
@@ -26,6 +35,7 @@ from google import genai
 from google.genai import types
 from piper import PiperVoice, SynthesisConfig
 
+import head
 from head import (HeadMotion, HeadWindow, Plan, plan_sentence, rms_level,
                   strip_tags)
 
@@ -53,11 +63,20 @@ def _arg(flag, default=None):
 HW = None               # RobotHeadController, or None for simulation only
 HEAD_PRESENT = False    # set in run() once the head answers limits()
 
+# Show Gemini's transcript exactly as it arrives, tags and all, before
+# strip_tags() removes them and before Piper ever sees it. This is the only
+# place the model's raw output is visible: everything printed later is the
+# cleaned text. Underscore spelling accepted too, since both read naturally.
+LLM_PRINT = "--llm-print" in sys.argv or "--llm_print" in sys.argv
+
 if "--no-head" not in sys.argv:
     try:
         import head_hw
         import head_link
-        HW = head_hw.connect(_arg("--head"), verbose="--verbose" in sys.argv)
+        HW = head_hw.connect(_arg("--head"), verbose="--verbose" in sys.argv,
+                             gain=_arg("--gain"))
+        if _arg("--gesture-rate"):
+            head.GESTURE_RATE_SCALE = float(_arg("--gesture-rate"))
     except Exception as e:
         print(f"[head] no hardware link ({e}); simulation only")
 
@@ -105,12 +124,39 @@ SYSTEM_PROMPT = (
     "Your highest priority is maintaining a safe and secure environment. "
     "You continuously monitor the surrounding environment, observe movements "
     "use \"sir\" when addressing people, and provide clear and concise information. "
-    "You MUST include emotion actions from this list within each sentence:"
-    "1. head_calm, 2. head_up_to_down_hard, 3. head_up_to_down_medium, 4. head_left_to_right_hard, 5. head_left_to_right_medium."
-    "Example: I am Spera [head_calm] here to help sir [head_up_to_down_hard].Does that sound like a suitable refinement, sir? [head_calm]"
-    "you should follow this format on every response."
-    "TOOL USE GUIDE:"
-    "if your vision cant see what users says about that you should use the tool \"look_around\" to see the surrounding environment and report any suspicious activity."
+    # HEAD GESTURES. One label per sentence, at a fixed position, from a
+    # four-word vocabulary -- a classification the model can actually do. The
+    # earlier instruction ("include emotion actions within each sentence") was
+    # decoration and got placed at random: questions came back tagged as head
+    # shakes and refusals as calm. head.plan_sentence maps these to gestures,
+    # and falls back to reading the text when a tag is missing.
+    "HEAD GESTURES: Begin EVERY sentence with exactly one intent tag, chosen "
+    "from these four: [deny] [affirm] [ask] [neutral]. "
+    "Use [deny] whenever your sentence says NO: refusing a request, denying "
+    "something, saying you cannot do something, OR answering the user's "
+    "yes/no question in the negative. If the user asks whether something is "
+    "there and you answer that it is not, that is [deny] -- you are saying "
+    "no to them, even when the news is good. "
+    "Use [affirm] when you are confirming, agreeing, answering yes, or "
+    "reporting unprompted that all is well. "
+    "Use [ask] when the sentence is a question to the user. "
+    "Use [neutral] ONLY when none of the other three apply. "
+    "Never use [neutral] for a sentence that ends in a question mark -- that "
+    "is always [ask]. Never use [neutral] for a sentence saying you cannot, "
+    "will not, or are not allowed to do something -- that is always [deny]. "
+    "The tag goes at the START of the sentence, before the first word, and "
+    "never anywhere else. Use exactly one per sentence. "
+    "Example: [affirm] The area is clear, sir. [deny] I cannot access the "
+    "first floor. [ask] Is there anything else you need, sir? "
+    # look_around costs a real head sweep and a pause in the conversation, so
+    # it has to be asked for rather than merely permitted. The looser wording
+    # this replaces had the model sweeping the room in response to "Hello".
+    "TOOL USE GUIDE: "
+    "Use the \"look_around\" tool ONLY when the user asks you to look, check, "
+    "scan, inspect, or patrol the surroundings, or asks what you can see right "
+    "now. Do NOT use it for greetings, for small talk, for questions about "
+    "yourself or your capabilities, or for anything you can answer without "
+    "looking. When in doubt, answer without the tool."
 )
 
 
@@ -127,43 +173,49 @@ def _tool_get_current_time(args):
 def _get_current_user_name(args):
     return {"username": "spera Administration"}
 
-SCAN_SECONDS = 1.5   # simulated sweep, when there is no head to ask
+SCAN_SECONDS = 1.5   # how long the sweep runs before the reply starts
 
 def _tool_look_around(args):
     # A deliberate, discrete action, unlike the speech-synced gestures. Gemini
-    # stays silent until this returns, so taking time here is what makes the
-    # sweep visible at all -- otherwise the first sentence's gesture replaces
-    # it within a few hundred milliseconds and the head never looks anywhere.
-    # This runs on a worker thread, so the mic and websocket are unaffected.
-    if HEAD_PRESENT:
-        # The real head sweeps five stops and reports back what it saw; its
-        # own sentence is a better tool result than anything invented here.
-        # Jog is held off for the duration -- a jog packet mid-look abandons
-        # the look -- so the simulated sweep is stretched to roughly match.
+    # stays silent until this returns, so taking a moment here is what makes
+    # the sweep visible at all -- otherwise the first sentence's gesture
+    # replaces it within a few hundred milliseconds and the head never looks
+    # anywhere. This runs on a worker thread, so the mic and websocket are
+    # unaffected.
+    #
+    # The sweep is driven as an ordinary gesture over jog, NOT through
+    # head_link.look(). look("look_around") is a five-stop sweep that blocks
+    # for about nine seconds, and because function calling is synchronous that
+    # is nine seconds of dead air -- long enough that a stray noise barges in
+    # and cancels the reply entirely, which is what it did to a greeting in
+    # testing. The head's own spoken report is not worth losing the answer for.
+    # --blocking-look opts back into it.
+    if HEAD_PRESENT and "--blocking-look" in sys.argv:
         HEAD.begin_gesture(Plan("scan", 8.0, "", "look_around tool"))
         said = head_hw.directed_look(HW, "look_around")
         HEAD.end_speech()
         if said:
             return {"result": said}
-    HEAD.begin_gesture(Plan("scan", 2.4, "", "look_around tool"))
+    HEAD.begin_gesture(Plan("scan", SCAN_SECONDS + 0.9, "", "look_around tool"))
     time.sleep(SCAN_SECONDS)
+    HEAD.end_speech()
     return {"result": "I am looking around the environment for any suspicious activity."}
 
 TOOLS = {
-    "get_current_time": (
-        {
-            "name": "get_current_time",
-            "description": "Returns the current local date and time.",
-        },
-        _tool_get_current_time,
-    ),
-    "get_current_user_name": (
-        {
-            "name": "get_current_user_name",
-            "description": "Returns the current user name.",
-        },
-        _get_current_user_name,
-    ),
+    # "get_current_time": (
+    #     {
+    #         "name": "get_current_time",
+    #         "description": "Returns the current local date and time.",
+    #     },
+    #     _tool_get_current_time,
+    # ),
+    # "get_current_user_name": (
+    #     {
+    #         "name": "get_current_user_name",
+    #         "description": "Returns the current user name.",
+    #     },
+    #     _get_current_user_name,
+    # ),
     "look_around": (
         {
             "name": "look_around",
@@ -279,16 +331,38 @@ def split_speakable(buffer):
     return chunks, buffer
 
 
+# The intent tag opens a sentence, but split_speakable cuts at commas once a
+# chunk passes CLAUSE_FLUSH_CHARS -- so a long sentence arrives as several
+# chunks and only the first carries the tag. Without this the rest fall back to
+# the keyword ladder mid-sentence, which is how "[deny] I cannot fly," / "sir;
+# my capabilities are restricted..." ended up planned by two different sources.
+# The tag therefore sticks until the sentence actually ends.
+pending_tag = ()
+
+
 def enqueue(sentence):
-    """Strip the model's [head_*] tags, plan a gesture, queue the sentence.
+    """Strip the model's tags, plan a gesture, queue the sentence.
 
     The tags have to come out here: anything still in the string when it
     reaches Piper is read aloud.
     """
+    global pending_tag
+    if LLM_PRINT:
+        # Raw, before anything is stripped: what the model actually emitted.
+        print(f"\n\033[2;36m[llm] {sentence}\033[0m", flush=True)
     clean, tags = strip_tags(sentence)
+    if tags:
+        pending_tag = tags
     if not clean:
-        return
-    sentence_queue.put((speak_turn, clean, plan_sentence(clean, tags)))
+        return          # a chunk that was only a tag; it now applies to the next
+    # `inherited` distinguishes a tag this fragment carried itself from one
+    # picked up off the sentence it belongs to; plan_sentence trusts the first
+    # more than the second.
+    sentence_queue.put((speak_turn, clean,
+                        plan_sentence(clean, tags or pending_tag,
+                                      inherited=not tags)))
+    if clean.rstrip()[-1:] in ".!?":
+        pending_tag = ()        # sentence finished; the tag does not carry over
 
 
 def speak_worker():
@@ -351,7 +425,7 @@ def speak_worker():
 
 async def receive_audio(session):
     """Turns Gemini's transcript into sentences for Piper to speak."""
-    global last_was_input, speak_turn, turn_active
+    global last_was_input, speak_turn, turn_active, pending_tag
     text_buffer = ""
     while True:
         turn = session.receive()
@@ -372,6 +446,7 @@ async def receive_audio(session):
                         sentence_queue.get_nowait()
                     except queue.Empty:
                         break
+                pending_tag = ()  # do not carry a cancelled turn's tag forward
                 HEAD.interrupt()  # abandon the gesture too, not just the audio
                 print()
             if sc.output_transcription:
@@ -411,7 +486,9 @@ async def run():
     # driven: the sliders take their range from it, and the mixer clamps to it.
     # limits() blocks for up to its timeout, hence the thread.
     if HW is not None:
-        HEAD_PRESENT = await asyncio.to_thread(head_hw.apply_limits, HEAD)
+        print(f"[head] output gain pan x{HW.gain_pan:.2f} tilt x{HW.gain_tilt:.2f}"
+              f"   gesture rate x{head.GESTURE_RATE_SCALE:.2f}")
+        HEAD_PRESENT = await asyncio.to_thread(head_hw.apply_limits, HEAD, HW)
         if HEAD_PRESENT:
             print(f"[head] hardware at {head_link.target()} - "
                   f"travel read from the neck")
@@ -424,6 +501,8 @@ async def run():
             HeadWindow(HEAD).start()
         except Exception as e:
             print(f"[head] no window ({e}); running with the log only")
+    if LLM_PRINT:
+        print("[llm]  printing Gemini's raw transcript (tags included)")
     speaker = asyncio.create_task(asyncio.to_thread(speak_worker))
     try:
         async with client.aio.live.connect(
@@ -440,6 +519,16 @@ async def run():
         speak_turn += 1  # cuts any in-flight speech short
         sentence_queue.put(None)
         await speaker
+        if head.TAG_DISAGREEMENTS:
+            print(f"\n[head] {len(head.TAG_DISAGREEMENTS)} sentences where the "
+                  f"model's tag and the text heuristic disagreed:")
+            for text, tagged, guessed in head.TAG_DISAGREEMENTS[-15:]:
+                print(f"  tag={tagged:<9} text={guessed:<9} {text[:58]}")
+            print("  (the tag won. If the text column reads better, the prompt "
+                  "needs work; if the tag column does, the ladder does.)")
+        if HW is not None and HW.sent:
+            print(f"[head] {HW.sent} jogs sent, {HW.clipped} clipped at the "
+                  f"neck's travel ({100 * HW.clipped / HW.sent:.0f}%)")
         HEAD.stop()
         if audio_stream:
             audio_stream.close()
