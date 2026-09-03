@@ -9,5 +9,6 @@ dependencies = [
     "google-genai>=2.17.0",
     "piper-tts>=1.6.1",
     "pyaudio>=0.2.14",
+    "pynput>=1.8.2",
     "sounddevice>=0.5.5",
 ]
