@@ -311,7 +311,8 @@ async def receive_audio(session):
                 continue
             sc = response.server_content
             if not sc:
-                continue
+                continue                                                                                                                        
+                
             if sc.interrupted:
                 # Barge-in: invalidate this turn so the worker drops whatever
                 # it is speaking, then throw away everything still pending.

@@ -20,6 +20,13 @@ neck achieves -- the sim has no inertia, the hardware does:
 
     --gain 2.2          scale the angle sent to the neck (not the simulation)
     --gesture-rate 0.7  slow every gesture down, so the neck can keep up
+
+And one for the neck disagreeing with the window about which way is up, which
+happens when a servo is mounted or geared against the documented convention:
+
+    --invert pan,tilt   mirror both axes on the wire (the shipped default)
+    --invert tilt       mirror pitch only
+    --invert none       trust the protocol's convention as written
 """
 
 import asyncio
@@ -74,7 +81,7 @@ if "--no-head" not in sys.argv:
         import head_hw
         import head_link
         HW = head_hw.connect(_arg("--head"), verbose="--verbose" in sys.argv,
-                             gain=_arg("--gain"))
+                             gain=_arg("--gain"), invert=_arg("--invert"))
         if _arg("--gesture-rate"):
             head.GESTURE_RATE_SCALE = float(_arg("--gesture-rate"))
     except Exception as e:

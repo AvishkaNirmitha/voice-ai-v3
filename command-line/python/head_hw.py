@@ -19,6 +19,11 @@ better answer than anything this side could invent. Jog packets have to stop
 while it runs -- one arriving mid-look abandons the look -- which is what
 suspended() is for.
 
+WHICH WAY IS UP. The simulation and the neck have to agree on the sign of each
+axis or the window becomes actively misleading -- it lifts its chin while the
+real head drops it. INVERT_PAN/INVERT_TILT below reconcile the two frames, and
+they do it at the wire and only at the wire: see the note on them.
+
 HANDING THE HEAD BACK. While jog packets arrive the head stops tracking faces
 and stops gesturing on its own, and it takes itself back about two seconds
 after the last one. So this controller goes quiet when head.py reports that
@@ -63,6 +68,36 @@ FALLBACK = {"yaw_min": -30.0, "yaw_max": 30.0,
 GAIN_PAN = 2.2
 GAIN_TILT = 2.2
 
+# WHICH WAY IS UP ON THE REAL NECK. head.py and the head_link protocol agree on
+# paper -- pan/yaw + is the robot's right, tilt/pitch + is up -- but a servo
+# that is mounted or geared the other way round makes the hardware read that
+# convention backwards, and then the window and the neck disagree: the
+# simulation lifts its chin while the real head drops it.
+#
+# The correction belongs HERE and nowhere else. Flipping a sign in head.py
+# would flip the window too, so the two would agree by both being wrong;
+# flipping it inside a gesture would fix that gesture and leave the state poses
+# and the RMS accent inverted. This is the single place where the simulation's
+# pose becomes a wire command, so this is where the frames are reconciled --
+# the window keeps showing the intended pose and only the datagram is flipped.
+#
+# Both axes are mirrored on this build of the neck: confirmed on the bench,
+# the window turning left while the head turned right and lifting its chin
+# while the head dropped it. Set from main_with_head.py's --invert.
+INVERT_PAN = True
+INVERT_TILT = True
+
+
+def _orient(lo, hi, invert):
+    """Re-express one axis's travel from the head's frame in the simulation's.
+
+    Inverting an axis does not merely negate its bounds, it SWAPS them: a neck
+    that pitches -24.9..+33.7 accepts simulated tilts of -33.7..+24.9. Negating
+    without swapping yields min > max, and every clamp after it collapses the
+    axis onto a single angle -- the head would simply stop moving on it.
+    """
+    return (-hi, -lo) if invert else (lo, hi)
+
 
 class RobotHeadController(SimHeadController):
     """Sends every resolved pose to the real head, and keeps it for the window.
@@ -72,7 +107,8 @@ class RobotHeadController(SimHeadController):
     """
 
     def __init__(self, send_hz=SEND_HZ, settle_s=SETTLE_S, release_idle=True,
-                 gain_pan=GAIN_PAN, gain_tilt=GAIN_TILT):
+                 gain_pan=GAIN_PAN, gain_tilt=GAIN_TILT,
+                 invert_pan=None, invert_tilt=None):
         super().__init__()
         self._period = 1.0 / send_hz
         self._settle = settle_s
@@ -83,14 +119,24 @@ class RobotHeadController(SimHeadController):
         self._lock = threading.Lock()
         self.gain_pan = float(gain_pan)
         self.gain_tilt = float(gain_tilt)
-        # The neck's own travel, which bounds whatever the gain produces.
-        # Replaced by apply_limits() when the head answers.
-        self.pan_min, self.pan_max = FALLBACK["yaw_min"], FALLBACK["yaw_max"]
-        self.tilt_min, self.tilt_max = FALLBACK["pitch_min"], FALLBACK["pitch_max"]
+        # Read at construction, not at send time, so a controller built for a
+        # test can differ from the module default.
+        self.invert_pan = INVERT_PAN if invert_pan is None else bool(invert_pan)
+        self.invert_tilt = INVERT_TILT if invert_tilt is None else bool(invert_tilt)
+        # The neck's own travel, which bounds whatever the gain produces, held
+        # in the SIMULATION's frame so the clamp and the pose it clamps are
+        # measured the same way round. Replaced by apply_limits() when the head
+        # answers.
+        self.pan_min, self.pan_max = _orient(
+            FALLBACK["yaw_min"], FALLBACK["yaw_max"], self.invert_pan)
+        self.tilt_min, self.tilt_max = _orient(
+            FALLBACK["pitch_min"], FALLBACK["pitch_max"], self.invert_tilt)
         self.sent = 0
         self.clipped = 0        # frames the gain pushed past the neck's travel
 
     def set_limits(self, pan_min, pan_max, tilt_min, tilt_max):
+        """Adopt the neck's travel. Takes SIMULATION-frame bounds -- see
+        apply_limits(), which is what converts the head's own numbers."""
         with self._lock:
             self.pan_min, self.pan_max = float(pan_min), float(pan_max)
             self.tilt_min, self.tilt_max = float(tilt_min), float(tilt_max)
@@ -112,11 +158,18 @@ class RobotHeadController(SimHeadController):
         self._last_send = now
         self.sent += 1
         # Amplify, then bound by the real neck. In that order: the clamp is the
-        # safety net and has to be the last thing that touches the number.
+        # safety net and has to be the last thing that CONSTRAINS the number.
         out_pan = max(self.pan_min, min(self.pan_max, pan * self.gain_pan))
         out_tilt = max(self.tilt_min, min(self.tilt_max, tilt * self.gain_tilt))
         if out_pan != pan * self.gain_pan or out_tilt != tilt * self.gain_tilt:
             self.clipped += 1
+        # Into the head's frame last of all. The sign flip is a change of
+        # coordinates, not of magnitude, so it cannot undo the clamp above --
+        # the bounds it was clamped to were converted the same way round.
+        if self.invert_pan:
+            out_pan = -out_pan
+        if self.invert_tilt:
+            out_tilt = -out_tilt
         head_link.jog(out_pan, out_tilt)
 
     @contextlib.contextmanager
@@ -134,7 +187,28 @@ class RobotHeadController(SimHeadController):
             self._last_send = 0.0
 
 
-def connect(addr=None, verbose=False, gain=None):
+def parse_invert(spec):
+    """Read an --invert argument into (invert_pan, invert_tilt).
+
+        "pan,tilt"  the shipped default: this neck runs mirrored on both
+        "tilt"      pitch only
+        "none"/""   trust the protocol's convention as documented
+
+    Returns the module defaults when spec is None, so not passing the flag
+    leaves the constants above in charge.
+    """
+    if spec is None:
+        return INVERT_PAN, INVERT_TILT
+    axes = {a.strip().lower() for a in str(spec).split(",") if a.strip()}
+    axes.discard("none")
+    unknown = axes - {"pan", "tilt", "yaw", "pitch"}
+    if unknown:
+        raise ValueError(f"--invert: unknown axis {sorted(unknown)}; "
+                         "expected pan, tilt, none, or pan,tilt")
+    return bool(axes & {"pan", "yaw"}), bool(axes & {"tilt", "pitch"})
+
+
+def connect(addr=None, verbose=False, gain=None, invert=None):
     """Point head_link at the head. Returns a controller, or None if disabled.
 
     Never raises and never blocks on the head being present: UDP sendto to a
@@ -147,9 +221,14 @@ def connect(addr=None, verbose=False, gain=None):
     if addr:
         host, _, port = str(addr).partition(":")
         head_link.set_target(host or "127.0.0.1", int(port or 8770))
-    if gain is None:
-        return RobotHeadController()
-    return RobotHeadController(gain_pan=float(gain), gain_tilt=float(gain))
+    inv_pan, inv_tilt = parse_invert(invert)
+    kw = {"invert_pan": inv_pan, "invert_tilt": inv_tilt}
+    if gain is not None:
+        kw["gain_pan"] = kw["gain_tilt"] = float(gain)
+    ctl = RobotHeadController(**kw)
+    mirrored = ", ".join(n for n, on in (("pan", inv_pan), ("tilt", inv_tilt)) if on)
+    print(f"[head] axes mirrored on the wire: {mirrored or 'none'}")
+    return ctl
 
 
 def apply_limits(motion, controller=None, timeout=2.0):
@@ -162,13 +241,20 @@ def apply_limits(motion, controller=None, timeout=2.0):
     lim = head_link.limits(timeout=timeout)
     known = lim is not None
     lim = lim or FALLBACK
-    motion.set_limits(lim["yaw_min"], lim["yaw_max"],
-                      lim["pitch_min"], lim["pitch_max"])
+    # The head reports its travel in its OWN frame; the mixer and the
+    # controller both clamp poses expressed in the simulation's. On a mirrored
+    # axis those are not the same interval -- an asymmetric neck reporting
+    # pitch -24.9..+33.7 can be driven to a simulated tilt of -33.7..+24.9 --
+    # so the bounds are converted before either of them sees a number.
+    inv_pan = getattr(controller, "invert_pan", INVERT_PAN)
+    inv_tilt = getattr(controller, "invert_tilt", INVERT_TILT)
+    pan_min, pan_max = _orient(lim["yaw_min"], lim["yaw_max"], inv_pan)
+    tilt_min, tilt_max = _orient(lim["pitch_min"], lim["pitch_max"], inv_tilt)
+    motion.set_limits(pan_min, pan_max, tilt_min, tilt_max)
     if controller is not None:
         # The controller needs them as well: it applies the gain *after* the
         # mixer has already clamped, so it owns the last word on travel.
-        controller.set_limits(lim["yaw_min"], lim["yaw_max"],
-                              lim["pitch_min"], lim["pitch_max"])
+        controller.set_limits(pan_min, pan_max, tilt_min, tilt_max)
     return known
 
 

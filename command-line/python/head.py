@@ -146,8 +146,16 @@ def _win(u, edge=0.18):
 # 0.3 Hz drift of a few degrees, and the eye does not read that as motion at
 # all. Cycle counts come from the per-gesture rate below times the duration.
 
+# A shake sweeps the pan between -24 and +24 degrees and holds the head at a
+# fixed 6.5 degree tilt for the length of the gesture, so the sweep reads as a
+# deliberate "no" rather than a flat side-to-side wobble.
+SHAKE_TILT = -5
+
+
 def _g_shake(u, amp, cycles):
-    return Pose(pan=amp * math.sin(2 * math.pi * cycles * u) * _win(u))
+    w = _win(u)
+    return Pose(pan=amp * math.sin(2 * math.pi * cycles * u) * w,
+                tilt=SHAKE_TILT * w)
 
 
 def _g_nod(u, amp, cycles):
@@ -177,10 +185,10 @@ def _g_scan(u, amp, cycles):
 
 # name -> (function, amplitude in degrees, cycles per second)
 GESTURES = {
-    "shake":     (_g_shake, 18.0, 1),
-    "nod":       (_g_nod, 9.0, 1.5),
-    "nod_hard":  (_g_nod_hard, 13.0, 1.7),
-    "query":     (_g_query, 9.0, 0.0),
+    "shake":     (_g_shake, 24.0, 1),
+    # "nod":       (_g_nod, 9.0, 1.5),
+    # "nod_hard":  (_g_nod_hard, 13.0, 1.7),
+    # "query":     (_g_query, 9.0, 0.0),
     # The commonest tag by far in real use, so it cannot be the near-invisible
     # one: a person speaking neutrally still moves their head. Gentler and
     # slower than a nod, and it rides around neutral rather than dipping below

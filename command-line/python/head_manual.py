@@ -50,7 +50,8 @@ import time
 
 import head_link
 
-DEFAULT_ADDR = os.environ.get("ROBOT_HEAD_ADDR", "192.168.1.159:8770")
+# DEFAULT_ADDR = os.environ.get("ROBOT_HEAD_ADDR", "192.168.1.159:8770")
+DEFAULT_ADDR = os.environ.get("ROBOT_HEAD_ADDR", "127.0.0.1:8770")
 
 # Documented ceiling is 20-30 packets a second: the neck cannot follow faster,
 # so anything above this is wasted bandwidth, not smoother motion.
