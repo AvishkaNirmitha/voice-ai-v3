@@ -171,8 +171,12 @@ once, on the refusal, then talks normally through the reason.
 
 ```
 duration = clamp(len(text) / 13.5, 0.5, 9.0)          seconds
-cycles   = max(1.0, rate × GESTURE_RATE_SCALE × duration)
+cycles   = max(1.0, round(rate × GESTURE_RATE_SCALE × duration))
 ```
+
+`cycles` is rounded to a **whole** number. Because a gesture is now left where
+it ends (§5.6), where it ends matters: a fractional cycle would strand a shake
+mid-sweep and the head would sit cocked to one side until the next sentence.
 
 ---
 
@@ -183,7 +187,9 @@ cycles   = max(1.0, rate × GESTURE_RATE_SCALE × duration)
 ```
   STATE_POSE[state] ──► eased 10 %/frame ──┐   posture glides
                                             │
-  gesture fn(u, amp, cycles) × gain ───────┤   NOT eased
+  held pose from the last gesture ─────────┤   crossfaded out as a new
+                                            │   gesture takes over
+  gesture fn(u, amp, cycles) ──────────────┤   NOT eased
                                             │
   RMS accent   tilt −9.0° × envelope ──────┤   attack 0.55 / decay 0.12
                                             │
@@ -224,17 +230,21 @@ tracking about 2 s later.
 
 Amplitudes are **simulation** degrees, before the hardware gain.
 
-| Gesture | Drives | Amplitude | Rate | Shape | Triggered by |
-|---|---|---|---|---|---|
-| `shake` | pan **+** tilt | pan ±24.0°, tilt +6.5° held | 1.0 Hz | sine sweep, soft ramp in/out | `[deny]`; sentence opening with a negation; `is_refusal()`; `is_limitation()` |
-| `nod` | tilt | 0 → −9.0° | 1.5 Hz | dips below neutral and recovers | `[affirm]`; declarative fallback |
-| `nod_hard` | tilt | 0 → −13.0° | 1.7 Hz | same, `swing^0.7` — snappier | sentence ends `!` |
-| `query` | pan + tilt | pan +4.05°, tilt +4.95° | held | one sustained lean, no repeat | `[ask]`; sentence ends `?` |
-| `calm` | tilt | ±6.0° | 0.8 Hz | rides *around* neutral | `[neutral]`; phrase under 18 chars |
-| `scan` | pan | ±26.0° | 0.45 Hz | sine, no window | `look_around` tool only — never from text |
+| Gesture | Drives | Amplitude | Rate | Shape | **Leaves behind** | Triggered by |
+|---|---|---|---|---|---|---|
+| `shake` | pan **+** tilt | pan ±24.0°, tilt −5.0° | 1.0 Hz | sine sweep, ramps in | **tilt −5.0°** | `[deny]`; sentence opening with a negation; `is_refusal()`; `is_limitation()` |
+| `nod` | tilt | 0 → −9.0° | 1.5 Hz | dips below neutral and recovers | nothing | `[affirm]`; declarative fallback |
+| `nod_hard` | tilt | 0 → −13.0° | 1.7 Hz | same, `swing^0.7` — snappier | nothing | sentence ends `!` |
+| `query` | pan + tilt | pan +4.05°, tilt +4.95° | held | one sustained lean, no repeat | **the whole lean** | `[ask]`; sentence ends `?` |
+| `calm` | tilt | ±6.0° | 0.8 Hz | rides *around* neutral | nothing | `[neutral]`; phrase under 18 chars |
+| `scan` | pan | ±26.0° | 0.45 Hz | sine | nothing | `look_around` tool only — never from text |
 
 Cycles actually played over a 3-second sentence: `shake` 3.0, `nod` 4.5,
 `nod_hard` 5.1, `query` 1.0, `calm` 2.4, `scan` 1.35.
+
+The periodic gestures come to rest at zero on their own, because `cycles` is a
+whole number. Only `shake` and `query` end somewhere other than neutral, and
+those poses are **held** — see §5.6.
 
 `calm` is deliberately the gentlest: it is by far the commonest tag in real
 use, so it cannot be the near-invisible one, and it rides around neutral rather
@@ -281,7 +291,42 @@ The protocol in `head_link.look()` also accepts `look_up`, `look_down`,
 `look_left`, `look_right` and `look_center`, but no tool is wired to them in
 this script.
 
-### 5.5 Manual control
+### 5.5 The head keeps the pose a gesture leaves it in
+
+Gestures used to ramp back to zero before retiring, so the head visibly *un-did*
+each nod and shake. That return trip is a movement of its own, it means
+nothing, and it arrives just as the sentence it belonged to finishes. A person
+shakes their head and leaves it where it stopped.
+
+```
+ gesture playing                retired
+ ─────────────────────────────┬──────────────────────────────►
+                              │
+   shake sweeps ±24° pan      │   pan back at 0 (whole cycles)
+   and holds tilt −5°         │   tilt STAYS at −5°  ← held, indefinitely
+                              │
+   next gesture begins ───────┴──► the held pose crossfades out over
+                                    GESTURE_BLEND (18 %) of its length
+```
+
+Three rules keep this bounded:
+
+- **Replace, never accumulate.** A gesture's held pose replaces the previous
+  one, so `shake, shake, shake` rests at −5.0° and never at −15.0°.
+- **Whole cycles.** Periodic gestures return to their own centre, so only a
+  deliberately-held component survives.
+- **Ease toward the end pose, not toward zero.** When speech stops early, the
+  gesture settles into the posture it was heading for rather than undoing
+  itself — measured at 1.8 °/frame worst case, well under the 8.4 °/frame slew
+  ceiling.
+
+Barge-in is the exception: `interrupt()` clears the held pose, because snapping
+to attention means neutral.
+
+`RESIDUAL_RELAX` in `head.py` decays the held pose per frame. It ships at
+`0.0` — hold indefinitely. Set it to `0.01` for a slow ~2 s settle instead.
+
+### 5.6 Manual control
 
 The Tk window's sliders call `HEAD.set_manual(True)`, which takes the head off
 the mixer entirely — gesture, accent and breath are all silenced so the sliders

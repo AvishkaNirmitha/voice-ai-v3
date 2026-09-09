@@ -67,7 +67,23 @@ GESTURE_RATE_SCALE = 1.0
 
 THINK_AFTER = 0.25              # silence before the "considering" pose engages
 YIELD_HOLD = 0.8                # how long the turn-yield lift is held
-GESTURE_RELEASE = 0.30          # fade-out when speech ends mid-gesture
+GESTURE_RELEASE = 0.30          # ease into the end pose when speech stops early
+
+# THE HEAD KEEPS THE POSE A GESTURE LEAVES IT IN. Springing back to the state
+# pose the moment a gesture retired was the thing that read as unnatural: the
+# return trip is a movement of its own, it means nothing, and it arrives just
+# as the sentence it belonged to finishes. A person shakes their head and
+# leaves it where it stopped.
+#
+# The held offset REPLACES the previous one rather than adding to it, so
+# repeated gestures cannot walk the head into its own limits, and a new gesture
+# crossfades out of it over GESTURE_BLEND of its length so the takeover is not
+# a step. Only gestures that end somewhere other than neutral leave anything
+# behind: shake holds its tilt, query holds its lean, and the periodic ones
+# (nod, calm, scan) come to rest at zero on their own.
+GESTURE_BLEND = 0.18            # crossfade out of the held pose, as a fraction
+RESIDUAL_RELAX = 0.0            # per-frame decay of the held pose; 0.0 holds it
+                                # indefinitely, 0.01 settles over ~2 s
 
 
 # --- loudness -------------------------------------------------------------
@@ -131,14 +147,19 @@ def _bell(u):
     return math.sin(math.pi * max(0.0, min(1.0, u)))
 
 
-def _win(u, edge=0.18):
-    """Soft ramp in and out, so a gesture neither starts nor ends abruptly.
+def _ramp(u, edge=0.18):
+    """Soft ramp IN, then full amplitude for the rest of the gesture.
 
-    Unlike _bell this holds full amplitude across the middle, which is what
-    lets a repeating gesture stay visible for the length of a long sentence.
+    This used to ramp out as well, which forced every gesture back to zero
+    before it retired -- so the head visibly UN-DID each nod and shake, and the
+    eye reads that trailing glide as a second, meaningless movement. A gesture
+    now ends wherever its own shape leaves it and the head keeps that pose;
+    see HeadMotion._residual.
+
+    Holding full amplitude across the middle is what lets a repeating gesture
+    stay visible for the length of a long sentence.
     """
-    u = max(0.0, min(1.0, u))
-    return min(1.0, u / edge, (1.0 - u) / edge)
+    return min(1.0, max(0.0, u) / edge)
 
 
 # Gestures repeat for as long as the sentence lasts. Stretching a single arc
@@ -153,7 +174,7 @@ SHAKE_TILT = -5
 
 
 def _g_shake(u, amp, cycles):
-    w = _win(u)
+    w = _ramp(u)
     return Pose(pan=amp * math.sin(2 * math.pi * cycles * u) * w,
                 tilt=SHAKE_TILT * w)
 
@@ -161,22 +182,22 @@ def _g_shake(u, amp, cycles):
 def _g_nod(u, amp, cycles):
     # Dips and recovers, repeatedly: a nod lives below the neutral line.
     swing = 0.5 - 0.5 * math.cos(2 * math.pi * cycles * u)
-    return Pose(tilt=-amp * swing * _win(u))
+    return Pose(tilt=-amp * swing * _ramp(u))
 
 
 def _g_nod_hard(u, amp, cycles):
     swing = 0.5 - 0.5 * math.cos(2 * math.pi * cycles * u)
-    return Pose(tilt=-amp * (swing ** 0.7) * _win(u))
+    return Pose(tilt=-amp * (swing ** 0.7) * _ramp(u))
 
 
 def _g_query(u, amp, cycles):
     # Held lean rather than a repeat: a question is one sustained posture.
-    lean = _win(u, 0.30)
+    lean = _ramp(u, 0.30)
     return Pose(pan=amp * 0.45 * lean, tilt=amp * 0.55 * lean)
 
 
 def _g_calm(u, amp, cycles):
-    return Pose(tilt=amp * math.sin(2 * math.pi * cycles * u) * _win(u))
+    return Pose(tilt=amp * math.sin(2 * math.pi * cycles * u) * _ramp(u))
 
 
 def _g_scan(u, amp, cycles):
@@ -189,13 +210,24 @@ GESTURES = {
     "nod":       (_g_nod, 9.0, 1.5),
     "nod_hard":  (_g_nod_hard, 13.0, 1.7),
     "query":     (_g_query, 9.0, 0.0),
-    # The commonest tag by far in real use, so it cannot be the near-invisible
-    # one: a person speaking neutrally still moves their head. Gentler and
-    # slower than a nod, and it rides around neutral rather than dipping below
-    # it, so the two stay distinguishable.
+    # calm is the commonest tag by far in real use, so it cannot be the
+    # near-invisible one: a person speaking neutrally still moves their head.
+    # Gentler and slower than a nod, and it rides around neutral rather than
+    # dipping below it, so the two stay distinguishable.
     "calm":      (_g_calm, 6.0, 0.8),
     "scan":      (_g_scan, 26.0, 0.45),
 }
+
+
+def _end_pose(gesture):
+    """Where a gesture is designed to leave the head.
+
+    Evaluated at u = 1.0 rather than at whatever u the gesture happened to be
+    retired on: the frame loop can overshoot the duration by a frame, and a
+    periodic gesture sampled slightly past its end is mid-swing, not at rest.
+    """
+    _name, fn, amp, _started, _duration, cycles = gesture
+    return fn(1.0, amp, cycles)
 
 # INTENT TAGS. The prompt asks Gemini to open every sentence with exactly one
 # of these. It is a classification task with four obvious answers, which the
@@ -487,6 +519,7 @@ class HeadMotion:
 
         self._gesture = None            # (name, fn, amp, started, duration, cycles)
         self._release = None            # when the current gesture began fading
+        self._residual = Pose()         # pose the last gesture left behind, held
         self._gain = _AutoGain()
         self._rms_raw = 0.0
         self._rms_env = 0.0
@@ -547,6 +580,7 @@ class HeadMotion:
             self._manual = on
             if on:
                 self._gesture = None
+                self._residual = Pose()
                 self._rms_raw = 0.0
         self._log("MANUAL on -- mixer bypassed" if on else "MANUAL off")
 
@@ -566,7 +600,12 @@ class HeadMotion:
         if plan is None:
             return
         fn, amp, rate = GESTURES.get(plan.gesture, GESTURES["nod"])
-        cycles = (max(1.0, rate * GESTURE_RATE_SCALE * plan.duration)
+        # Rounded to a WHOLE number of cycles. Now that a gesture is left where
+        # it ends, where it ends matters: a fractional cycle strands a shake
+        # mid-sweep and the head sits cocked to one side until the next
+        # sentence. On a whole cycle the sine returns to its own centre, so the
+        # only thing a gesture leaves behind is the pose it deliberately holds.
+        cycles = (max(1.0, float(round(rate * GESTURE_RATE_SCALE * plan.duration)))
                   if rate else 1.0)
         with self._lock:
             self._speaking = True
@@ -598,6 +637,7 @@ class HeadMotion:
             self._speaking = False
             self._gesture = None
             self._release = None
+            self._residual = Pose()     # snapping to attention means neutral
             self._rms_raw = 0.0
             self._rms_env = 0.0
             self.state = "listening"
@@ -665,18 +705,25 @@ class HeadMotion:
             self._rms_env += (level - self._rms_env) * k
             env = self._rms_env
 
-            # Retire a gesture that has run its course, or finish fading one
-            # that speech ended under.
+            # Retire a gesture that has run its course, or finish easing one
+            # that speech ended under. Either way the pose it was designed to
+            # end on becomes the held offset, so the head stays where the
+            # gesture put it instead of travelling back to the state pose.
             gesture_gain = 1.0
             if gesture and now - gesture[3] > gesture[4]:
+                self._residual = _end_pose(gesture)
                 self._gesture = gesture = None
                 self._release = release = None
             elif release is not None:
                 gesture_gain = 1.0 - (now - release) / GESTURE_RELEASE
                 if gesture_gain <= 0.0:
+                    self._residual = _end_pose(gesture)
                     self._gesture = gesture = None
                     self._release = release = None
                     gesture_gain = 0.0
+            residual = self._residual
+            if RESIDUAL_RELAX:
+                self._residual = residual * (1.0 - RESIDUAL_RELAX)
 
         # Only the state pose is eased. Those are deliberate changes of posture
         # and should glide into place.
@@ -696,8 +743,20 @@ class HeadMotion:
         if not manual:
             if gesture:
                 _, fn, amp, started, duration, cycles = gesture
-                final = final + fn((now - started) / duration, amp,
-                                   cycles) * gesture_gain
+                u = (now - started) / duration
+                end = _end_pose(gesture)
+                # Two things at once. The gesture itself eases toward its own
+                # END pose rather than toward zero, so a sentence that stops
+                # early settles into the posture it was heading for instead of
+                # undoing itself. And the pose the PREVIOUS gesture left behind
+                # crossfades out as this one takes over -- without that the two
+                # holds would stack, and a shake after a shake would lift the
+                # head twice as far.
+                held = residual * (1.0 - min(1.0, max(0.0, u) / GESTURE_BLEND))
+                final = final + held + end \
+                    + (fn(u, amp, cycles) + end * -1.0) * gesture_gain
+            else:
+                final = final + residual
             final = final + Pose(tilt=-RMS_ACCENT_DEG * env)
             breath_amp = (BREATH_DEG_BUSY if state in ("listening", "speaking")
                           else BREATH_DEG)
