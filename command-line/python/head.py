@@ -186,9 +186,9 @@ def _g_scan(u, amp, cycles):
 # name -> (function, amplitude in degrees, cycles per second)
 GESTURES = {
     "shake":     (_g_shake, 24.0, 1),
-    # "nod":       (_g_nod, 9.0, 1.5),
-    # "nod_hard":  (_g_nod_hard, 13.0, 1.7),
-    # "query":     (_g_query, 9.0, 0.0),
+    "nod":       (_g_nod, 9.0, 1.5),
+    "nod_hard":  (_g_nod_hard, 13.0, 1.7),
+    "query":     (_g_query, 9.0, 0.0),
     # The commonest tag by far in real use, so it cannot be the near-invisible
     # one: a person speaking neutrally still moves their head. Gentler and
     # slower than a nod, and it rides around neutral rather than dipping below
