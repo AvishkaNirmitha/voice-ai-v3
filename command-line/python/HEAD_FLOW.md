@@ -237,10 +237,10 @@ Amplitudes are **simulation** degrees, before the hardware gain.
 | `nod_hard` | tilt | 0 → −13.0° | 1.7 Hz | same, `swing^0.7` — snappier | nothing | sentence ends `!` |
 | `query` | pan + tilt | pan +4.05°, tilt +4.95° | held | one sustained lean, no repeat | **the whole lean** | `[ask]`; sentence ends `?` |
 | `calm` | tilt | ±6.0° | 0.8 Hz | rides *around* neutral | nothing | `[neutral]`; phrase under 18 chars |
-| `scan` | pan | ±26.0° | 0.45 Hz | sine | nothing | `look_around` tool only — never from text |
+| `scan` | pan **then** tilt | pan ±42.0°, tilt −30.0…+24.0° | one pass | left → right → up → down, in sequence | tilt −3.0° (its range midpoint) | `look_around` tool only — never from text |
 
-Cycles actually played over a 3-second sentence: `shake` 3.0, `nod` 4.5,
-`nod_hard` 5.1, `query` 1.0, `calm` 2.4, `scan` 1.35.
+Cycles actually played over a 3-second sentence, after the whole-number
+rounding: `shake` 3, `nod` 4, `nod_hard` 5, `query` 1, `calm` 2, `scan` 1.
 
 The periodic gestures come to rest at zero on their own, because `cycles` is a
 whole number. Only `shake` and `query` end somewhere other than neutral, and
@@ -286,6 +286,45 @@ default        HEAD.begin_gesture(Plan("scan", 2.4s))   ← ordinary gesture
 The blocking path is **opt-in** on purpose. Function calling is synchronous, so
 those nine seconds are dead air — long enough that a stray noise barges in and
 cancels the reply entirely, which is what it did to a greeting in testing.
+
+`scan` is the one gesture that does **not** repeat to fill its sentence. It is a
+single pass through a fixed routine, in two halves — pan first, then tilt:
+
+```
+   0.00s  pan   -4.4                    left half of the sweep
+   0.28s  pan  -42.0   ◄ LEFT
+   0.84s  pan  +41.1   ◄ RIGHT
+   1.26s  tilt  +6.7                    handover, pan back at 0
+   1.54s  tilt +22.7   ◄ UP
+   2.10s  tilt -29.9   ◄ DOWN
+   2.38s  tilt  -3.0                    rests at its range midpoint
+```
+
+Driving both axes together traces a diagonal that covers neither, and reads as
+one vague movement rather than a search. Split in half, each axis gets the
+viewer's whole attention for its own sweep.
+
+It uses the full mechanical envelope deliberately — the tool exists to make the
+robot visibly search the room. Tilt is asymmetric because the neck is: it drops
+further than it lifts. Both halves start and end at zero offset, so the
+handover at the midpoint is continuous and the scan leaves the head at the
+middle of its tilt range — which matters now that a gesture's last pose is held
+(§5.5), since a scan ending at an extreme would leave the head staring at the
+ceiling.
+
+A longer look performs the same routine more slowly rather than twice, so
+`SCAN_SECONDS` in `main_with_head.py` sets how deliberate the search reads. At
+the shipped 1.5 s (a 2.4 s gesture) each of the four moves gets 0.6 s.
+
+At `GAIN 2.2` the neck reaches its stops on both axes and **dwells there for
+about half the sweep**, so each move reads as a trapezoid rather than a sine:
+snap to the extreme, hold, snap back. That is not necessarily wrong for a
+search — pausing at each extreme looks deliberate. If you want smooth sweeps
+instead, `scan` needs a gain of about 1.0 rather than 2.2: the amplitudes above
+are already at travel scale, so the inertia compensation has nothing left to
+compensate for.
+
+Peak speeds are 220 °/s pan and 192 °/s tilt, against the 420 °/s slew ceiling.
 
 The protocol in `head_link.look()` also accepts `look_up`, `look_down`,
 `look_left`, `look_right` and `look_center`, but no tool is wired to them in

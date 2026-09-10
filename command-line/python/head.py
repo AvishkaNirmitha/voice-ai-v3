@@ -200,8 +200,40 @@ def _g_calm(u, amp, cycles):
     return Pose(tilt=amp * math.sin(2 * math.pi * cycles * u) * _ramp(u))
 
 
+# look_around exists to make the robot visibly search the room, so the sweep
+# uses the whole working envelope rather than a token turn of the head. The
+# tilt range is asymmetric because the neck is: it drops further than it lifts.
+SCAN_TILT_LO, SCAN_TILT_HI = -30.0, 24.0
+SCAN_TILT_MID = (SCAN_TILT_HI + SCAN_TILT_LO) / 2.0     # -3.0
+SCAN_TILT_AMP = (SCAN_TILT_HI - SCAN_TILT_LO) / 2.0     # 27.0
+
+
 def _g_scan(u, amp, cycles):
-    return Pose(pan=amp * math.sin(2 * math.pi * cycles * u))
+    """Two deliberate sweeps in sequence: LEFT, RIGHT, then UP, DOWN.
+
+    Driving both axes together traces a diagonal that covers neither, and reads
+    as one vague movement rather than a search. Split in half, each axis gets
+    the viewer's whole attention for its own sweep.
+
+    `cycles` is ignored. Every other gesture repeats to fill the sentence it
+    belongs to; a scan is one pass through a fixed routine, so a longer look
+    performs the same routine more slowly rather than twice.
+
+    Both halves start and end at zero offset, so the transition at the midpoint
+    is continuous and the scan leaves the head at the middle of its tilt range
+    -- which matters now that a gesture's last pose is HELD (see _residual).
+    """
+    u = max(0.0, min(1.0, u))
+    if u < 0.5:
+        a = u / 0.5
+        # Negative pan is the robot's left, so -sin sweeps left before right.
+        return Pose(pan=-amp * math.sin(2 * math.pi * a))
+    b = (u - 0.5) / 0.5
+    # The tilt range is asymmetric, so this sine is centred on SCAN_TILT_MID
+    # rather than on zero. The short ramp eases that offset in at the handover
+    # instead of stepping onto it.
+    return Pose(tilt=(SCAN_TILT_MID + SCAN_TILT_AMP * math.sin(2 * math.pi * b))
+                * _ramp(b, 0.08))
 
 
 # name -> (function, amplitude in degrees, cycles per second)
@@ -209,13 +241,13 @@ GESTURES = {
     "shake":     (_g_shake, 24.0, 1),
     "nod":       (_g_nod, 9.0, 1.5),
     "nod_hard":  (_g_nod_hard, 13.0, 1.7),
-    "query":     (_g_query, 9.0, 0.0),
+    "query":     (_g_query, -9.0, 0.0),
     # calm is the commonest tag by far in real use, so it cannot be the
     # near-invisible one: a person speaking neutrally still moves their head.
     # Gentler and slower than a nod, and it rides around neutral rather than
     # dipping below it, so the two stay distinguishable.
     "calm":      (_g_calm, 6.0, 0.8),
-    "scan":      (_g_scan, 26.0, 0.45),
+    "scan":      (_g_scan, 42.0, 0.45),
 }
 
 

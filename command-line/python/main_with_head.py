@@ -180,7 +180,7 @@ def _tool_get_current_time(args):
 def _get_current_user_name(args):
     return {"username": "spera Administration"}
 
-SCAN_SECONDS = 1.5   # how long the sweep runs before the reply starts
+SCAN_SECONDS = 2   # how long the sweep runs before the reply starts
 
 def _tool_look_around(args):
     # A deliberate, discrete action, unlike the speech-synced gestures. Gemini
