@@ -415,6 +415,35 @@ class STSBus:
         self.ser.write(self._build(BROADCAST_ID, INST_SYNC_WRITE, params))
         self.ser.flush()
 
+    def sync_set_targets(self, targets: Dict[int, Sequence[int]]) -> None:
+        """Like sync_set_positions, but each servo gets its OWN speed and accel.
+
+        `targets` maps servo id -> (counts, speed, accel). The sync-write frame
+        already carries an accel byte and a speed word per servo; the simpler
+        call above just repeats one value across all of them.
+
+        Per-servo profiles matter when one packet drives a neck: a pan servo
+        swinging 60 degrees and a tilt servo nudging 4 want different speeds,
+        and splitting them into two packets loses the one property sync-write
+        exists for -- both servos starting on the same instruction.
+
+        Broadcast, so no servo replies. That is what makes it usable in a
+        50 Hz control loop, where a status round-trip per servo would put a
+        timeout in the path of every frame.
+        """
+        per_servo = 7
+        params: List[int] = [Reg.GOAL_ACC, per_servo]
+        for sid, (pos, speed, accel) in targets.items():
+            params += [
+                sid,
+                int(accel) & 0xFF,
+                *_lo_hi(_to_sign_magnitude(int(round(pos)))),
+                0x00, 0x00,
+                *_lo_hi(abs(int(speed)) & 0x7FFF),
+            ]
+        self.ser.write(self._build(BROADCAST_ID, INST_SYNC_WRITE, params))
+        self.ser.flush()
+
     # -- VELOCITY CONTROL --------------------------------------------------
     def set_velocity(self, servo_id: int, speed: int, accel: Optional[int] = None) -> None:
         """Continuous rotation at `speed` counts/s. Negative = reverse.

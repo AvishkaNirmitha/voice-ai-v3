@@ -66,6 +66,7 @@ class Bridge:
         self._running = False
         self._lock = threading.Lock()
         self._pending: Dict[int, tuple] = {}   # sid -> (counts, speed, accel)
+        self._pose: Optional[Dict[int, tuple]] = None
         self.watch_ids: List[int] = []
 
     # -- lifecycle ---------------------------------------------------------
@@ -95,6 +96,18 @@ class Bridge:
         """Coalescing setter -- rapid slider drags collapse to the latest value."""
         with self._lock:
             self._pending[sid] = (int(counts), int(speed), int(accel))
+
+    def set_pose(self, targets: Dict[int, tuple]) -> None:
+        """Command every driven servo at once: sid -> (counts, speed, accel).
+
+        Separate from set_target because this is a CONTROL STREAM, not a user
+        action: a new pose arrives every frame and only the newest one matters,
+        so an unread pose is overwritten rather than queued. It also goes out
+        as a single broadcast packet, so both servos of a neck start on the
+        same instruction instead of one lagging the other by a round trip.
+        """
+        with self._lock:
+            self._pose = dict(targets)
 
     def _emit(self, kind: str, payload=None) -> None:
         self.outq.put((kind, payload))
@@ -134,6 +147,15 @@ class Bridge:
                         bus.set_position(sid, counts, speed=speed, accel=accel)
                     except STSError as exc:
                         self._emit("error", f"servo {sid}: {exc}")
+
+                # 2b. the newest streamed pose, if something is driving the neck
+                with self._lock:
+                    pose, self._pose = self._pose, None
+                if pose:
+                    try:
+                        bus.sync_set_targets(pose)
+                    except (STSError, OSError) as exc:
+                        self._emit("error", f"pose: {exc}")
 
                 # 3. telemetry sweep
                 now = time.monotonic()
@@ -231,8 +253,14 @@ class ServoPanel(ttk.LabelFrame):
 
     def _sync_enable(self) -> None:
         wheel = self.mode.get() == "wheel"
-        self.pos_scale.configure(state="disabled" if wheel else "normal")
-        self.vel_scale.configure(state="normal" if wheel else "disabled")
+        # A servo the robot is driving takes its position from the motion
+        # mixer, so the slider is shown greyed rather than left live to fight
+        # a 50 Hz stream it cannot win against. Speed and accel stay editable:
+        # those are profile settings the stream reads, not targets.
+        driven = self.app.driven(self.sid)
+        self.pos_scale.configure(state="disabled" if (wheel or driven) else "normal")
+        self.vel_scale.configure(
+            state="normal" if (wheel and not driven) else "disabled")
 
     def _retune(self) -> None:
         lo, hi = self.lo.get(), self.hi.get()
@@ -243,9 +271,14 @@ class ServoPanel(ttk.LabelFrame):
 
     # -- callbacks ---------------------------------------------------------
     def _on_pos(self) -> None:
+        # Publish speed and accel unconditionally -- the pose stream reads them
+        # off a plain dict, because Tk variables may only be touched from the
+        # thread that owns the widget.
+        self.app.note_profile(self.sid, round(self.speed.get()),
+                              round(self.accel.get()))
         if self._suppress or self.mode.get() != "position":
             return
-        if not self.app.live.get():
+        if not self.app.live.get() or self.app.driven(self.sid):
             return
         self.send_position()
 
@@ -317,16 +350,24 @@ class ServoPanel(ttk.LabelFrame):
 # ==========================================================================
 
 class App(ttk.Frame):
-    def __init__(self, root: tk.Tk, port: str, baud: int):
+    def __init__(self, root: tk.Tk, port: str, baud: int, driver=None):
         super().__init__(root, padding=12)
         self.pack(fill="both", expand=True)
         self.root = root
         self.bridge = Bridge()
         self.panels: Dict[int, ServoPanel] = {}
 
+        # Set when the neck is being driven by something else -- see
+        # head_servo.ServoHeadController. None means this window is the only
+        # thing commanding the bus, which is how the script runs standalone.
+        self.driver = driver
+        self._profile: Dict[int, tuple] = {}
+        self._profile_lock = threading.Lock()
+
         self.port = tk.StringVar(value=port)
         self.baud = tk.IntVar(value=baud)
         self.live = tk.BooleanVar(value=True)
+        self.robot = tk.BooleanVar(value=True)
         self.status = tk.StringVar(value="disconnected")
 
         self._build_toolbar()
@@ -353,10 +394,38 @@ class App(ttk.Frame):
         self.connect_btn.pack(side="left")
         ttk.Button(bar, text="Scan", command=self._scan).pack(side="left", padx=6)
         ttk.Checkbutton(bar, text="Live", variable=self.live).pack(side="left", padx=12)
+        if self.driver is not None:
+            ttk.Checkbutton(bar, text="Robot drives the neck", variable=self.robot,
+                            command=self._on_robot).pack(side="left")
         ttk.Button(bar, text="Stop all", width=9,
                    command=self._stop_all).pack(side="right")
         ttk.Button(bar, text="Release all", width=12,
                    command=self._release_all).pack(side="right", padx=6)
+
+    # -- sharing the bus with the motion system -----------------------------
+    def note_profile(self, sid: int, speed: int, accel: int) -> None:
+        """Record a servo's speed/accel where another thread may read it."""
+        with self._profile_lock:
+            self._profile[sid] = (int(speed), int(accel))
+
+    def profile(self, sid: int, default=(0, 0)) -> tuple:
+        with self._profile_lock:
+            return self._profile.get(sid, default)
+
+    def driven(self, sid: int) -> bool:
+        """True when the motion mixer, not this window, owns that servo."""
+        return (self.driver is not None and self.robot.get()
+                and sid in self.driver.servo_ids)
+
+    def _on_robot(self) -> None:
+        on = self.robot.get()
+        self.driver.set_enabled(on)
+        for panel in self.panels.values():
+            panel._sync_enable()
+            if not on:
+                panel._hold()       # take over from wherever the neck is now
+        self.status.set("robot is driving the neck" if on
+                        else "manual -- sliders own the neck")
 
     # -- actions -----------------------------------------------------------
     def _toggle_connect(self) -> None:
@@ -394,10 +463,18 @@ class App(ttk.Frame):
             p = ServoPanel(self.body, self, sid, counts)
             p.pack(fill="x", pady=6)
             self.panels[sid] = p
+            self.note_profile(sid, round(p.speed.get()), round(p.accel.get()))
         self.bridge.watch_ids = [sid for sid, _ in found]
         # torque defaults to on in the panel; make the servo agree
         for sid in self.panels:
             self.bridge.submit(lambda bus, s=sid: bus.set_torque(s, True))
+        # The scan is the only place the neck's resting counts are known, and
+        # those are what the motion mixer's zero is measured from -- so the
+        # driver is attached here rather than at startup.
+        if self.driver is not None:
+            self.driver.attach(self, dict(found))
+            for panel in self.panels.values():
+                panel._sync_enable()
 
     def _release_all(self) -> None:
         for sid, panel in self.panels.items():

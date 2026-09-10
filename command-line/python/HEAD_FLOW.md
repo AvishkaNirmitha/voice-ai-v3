@@ -411,6 +411,48 @@ travel, flattening the tops of the sine. `HW.clipped` counts those frames.
 
 ---
 
+## 6b. The other transport: `--direct-servo`
+
+When the servos are wired to this machine there is no head firmware to talk to,
+so the pose goes on the serial bus instead of into a UDP datagram. Nothing
+above `HeadController.write()` changes — same mixer, same gestures, same 50 Hz.
+
+```
+  mixer pose (sim frame)
+        │
+        ▼
+  clamp to +/-30 pan, +/-20 tilt      head_servo constants; there is no
+        │                             limits() to ask
+        ▼
+  counts = home + degrees / 0.0879    home = where the neck was resting
+        │                             when the program started
+        ▼
+  clamp 0..4095                       arithmetic hard stop
+        │
+        ▼
+  Bridge.set_pose()  ──►  sync_set_targets()  ──►  one broadcast packet
+                          both servos, per-servo speed and accel, no reply
+```
+
+Three things differ from the UDP path, all following from there being no
+firmware in between:
+
+| | UDP | direct servo |
+|---|---|---|
+| Gain | ×2.2, to pre-empt the firmware's low-pass | **1.0** — the servo runs its own speed/accel trajectory |
+| Idle | goes quiet so the head resumes face tracking | **stays on** — nothing here tracks faces, and a silent bus lets the neck sag |
+| Travel | read from the neck via `limits()` | constants in `head_servo.py` |
+
+The servo control panel opens alongside the conversation and shares the bus —
+one thread owns the port. Its speed and accel sliders feed the pose stream
+live; the position sliders are greyed while **Robot drives the neck** is
+checked, and un-checking it hands the neck back to the sliders.
+
+The simulation window is suppressed in this mode: two Tk roots in one process
+is a reliable way to hang the interpreter, and the servo panel is the more
+useful of the two since it is the only place torque, speed and accel can be
+reached.
+
 ## 7. Barge-in
 
 ```

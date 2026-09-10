@@ -27,6 +27,20 @@ happens when a servo is mounted or geared against the documented convention:
     --invert pan,tilt   mirror both axes on the wire (the shipped default)
     --invert tilt       mirror pitch only
     --invert none       trust the protocol's convention as written
+
+DRIVING THE SERVOS DIRECTLY. Everything above assumes the head's own firmware
+is listening on UDP. When the servos are wired to this machine instead there is
+nothing to talk to, so this drives the bus itself and opens the servo control
+panel alongside the conversation:
+
+    --direct-servo              serial bus instead of UDP
+    --servo-port /dev/ttyUSB0   default: the by-id path direct_servo_call uses
+    --servo-baud 1000000
+    --pan-id 1  --tilt-id 2     which servo is which axis
+    --servo-invert pan,tilt     if an axis runs backwards
+
+The neck's resting pose at startup becomes zero, so nothing jumps on connect.
+Speed and acceleration are read live from the window's sliders.
 """
 
 import asyncio
@@ -76,7 +90,29 @@ HEAD_PRESENT = False    # set in run() once the head answers limits()
 # cleaned text. Underscore spelling accepted too, since both read naturally.
 LLM_PRINT = "--llm-print" in sys.argv or "--llm_print" in sys.argv
 
-if "--no-head" not in sys.argv:
+# Which transport carries the pose. The two are exclusive: --direct-servo means
+# there is no head firmware to talk to, so head_link is never imported and no
+# UDP leaves the machine.
+DIRECT_SERVO = "--direct-servo" in sys.argv
+
+if DIRECT_SERVO:
+    try:
+        import head_servo
+        inv_pan, inv_tilt = head_servo.parse_invert(_arg("--servo-invert"))
+        HW = head_servo.ServoHeadController(
+            pan_id=int(_arg("--pan-id", head_servo.PAN_ID)),
+            tilt_id=int(_arg("--tilt-id", head_servo.TILT_ID)),
+            invert_pan=inv_pan, invert_tilt=inv_tilt)
+        if _arg("--gesture-rate"):
+            head.GESTURE_RATE_SCALE = float(_arg("--gesture-rate"))
+    except Exception as e:
+        # Fall all the way back, not half way. Leaving DIRECT_SERVO set would
+        # suppress the simulation window in favour of a servo panel that was
+        # never going to open, so the run would have no head and no window --
+        # worse than either mode on its own.
+        print(f"[servo] direct servo mode unavailable ({e}); simulation only")
+        DIRECT_SERVO = False
+elif "--no-head" not in sys.argv:
     try:
         import head_hw
         import head_link
@@ -492,7 +528,19 @@ async def run():
     # Ask the neck how far it actually travels before anything is drawn or
     # driven: the sliders take their range from it, and the mixer clamps to it.
     # limits() blocks for up to its timeout, hence the thread.
-    if HW is not None:
+    if DIRECT_SERVO and HW is not None:
+        # No limits() to ask and no firmware to answer it, so the travel comes
+        # from head_servo's own constants. Set before the window opens: the
+        # mixer must already be clamped when the first pose is resolved.
+        HEAD.set_limits(-HW.pan_limit, HW.pan_limit,
+                        -HW.tilt_limit, HW.tilt_limit)
+        head_servo.start(HEAD, HW, port=_arg("--servo-port"),
+                         baud=int(_arg("--servo-baud", 1_000_000)),
+                         simulation="--no-window" not in sys.argv)
+        print(f"[servo] driving the neck over the serial bus"
+              f"   gesture rate x{head.GESTURE_RATE_SCALE:.2f}")
+        print("[servo] control panel opening; it connects and scans on its own")
+    elif HW is not None:
         print(f"[head] output gain pan x{HW.gain_pan:.2f} tilt x{HW.gain_tilt:.2f}"
               f"   gesture rate x{head.GESTURE_RATE_SCALE:.2f}")
         HEAD_PRESENT = await asyncio.to_thread(head_hw.apply_limits, HEAD, HW)
@@ -503,7 +551,11 @@ async def run():
             print(f"[head] no answer from {head_link.target()} - "
                   f"jogs still sent, conservative limits, look_around simulated")
 
-    if "--no-window" not in sys.argv:
+    # In direct-servo mode the simulation window is opened by head_servo.start()
+    # instead, as a Toplevel of the servo panel's root -- one root, one thread,
+    # one mainloop. Starting a second one here would be the second Tk() that
+    # hangs the interpreter.
+    if "--no-window" not in sys.argv and not DIRECT_SERVO:
         try:
             HeadWindow(HEAD).start()
         except Exception as e:
@@ -534,8 +586,15 @@ async def run():
             print("  (the tag won. If the text column reads better, the prompt "
                   "needs work; if the tag column does, the ladder does.)")
         if HW is not None and HW.sent:
-            print(f"[head] {HW.sent} jogs sent, {HW.clipped} clipped at the "
-                  f"neck's travel ({100 * HW.clipped / HW.sent:.0f}%)")
+            if DIRECT_SERVO:
+                # The mixer already clamps to the same travel, so this counter
+                # is a guard rail rather than a measurement -- 0 is healthy.
+                print(f"[servo] {HW.sent} poses written"
+                      + (f", {HW.clipped} caught by the travel guard"
+                         if HW.clipped else ""))
+            else:
+                print(f"[head] {HW.sent} jogs sent, {HW.clipped} clipped at the "
+                      f"neck's travel ({100 * HW.clipped / HW.sent:.0f}%)")
         HEAD.stop()
         if audio_stream:
             audio_stream.close()

@@ -834,9 +834,16 @@ class HeadWindow:
     open handle cut-out -- so that a pose on screen is recognisable as the same
     pose on the bench.
 
-    Runs its own root and mainloop on a dedicated thread; every Tk call stays
-    on that thread. Optional -- the motion system is fully functional without
-    it, and on a headless Jetson it simply is not started.
+    Two ways in. start() gives it its own root and mainloop on a dedicated
+    thread, which is how it runs when nothing else wants a window. build(master)
+    puts it in a Toplevel of somebody else's root instead, for when another
+    window is already up -- the servo panel in --direct-servo mode.
+
+    Which one you use is not a style choice. Tk allows exactly one root per
+    process in practice, and every call against a widget has to come from the
+    thread that created it, so a second Tk() on a second thread is a reliable
+    way to hang the interpreter. Optional either way -- the motion system is
+    fully functional without it, and on a headless Jetson it is not started.
     """
 
     # Head geometry in local coordinates, origin at the pan/tilt centre.
@@ -867,13 +874,28 @@ class HeadWindow:
         self._syncing = False       # guards slider.set() against its callback
 
     def start(self):
+        """Own root, own thread, own mainloop."""
         self.thread.start()
         return self
 
-    def _run(self):
+    def build(self, master):
+        """Put the window in a Toplevel of `master` and return.
+
+        Call this ON the thread that owns `master`, and only from there --
+        there is no thread of our own here, because the caller's mainloop is
+        already running and is what will drive the redraw.
+        """
+        self._run(master)
+        return self
+
+    def _run(self, master=None):
         import tkinter as tk
 
-        root = tk.Tk()
+        root = tk.Toplevel(master) if master is not None else tk.Tk()
+        # Closing a borrowed window must not take the application with it, and
+        # must not leave draw() rescheduling itself against a destroyed widget.
+        if master is not None:
+            root.protocol("WM_DELETE_WINDOW", root.withdraw)
         root.title("Spera head - simulation")
         root.configure(bg=self.BG)
         root.resizable(False, False)
@@ -1087,7 +1109,8 @@ class HeadWindow:
             root.after(int(1000 / MOTION_HZ), draw)
 
         draw()
-        root.mainloop()
+        if master is None:
+            root.mainloop()
 
 
 # --- demo -----------------------------------------------------------------
