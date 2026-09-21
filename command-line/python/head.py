@@ -52,7 +52,7 @@ RMS_ATTACK = 0.55               # per-frame envelope coefficients: fast attack,
 RMS_DECAY = 0.12                # slow release, so accents punch then relax
 
 BREATH_HZ = 0.18                # idle oscillation
-BREATH_DEG = 1.5
+BREATH_DEG = 0
 BREATH_DEG_BUSY = 0.4           # damped while listening or speaking
 
 POSE_EASE = 0.10                # per-frame approach rate toward the STATE pose

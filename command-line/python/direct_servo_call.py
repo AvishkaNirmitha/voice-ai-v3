@@ -46,7 +46,7 @@ from feetech_sts import (
 TELEMETRY_PERIOD = 0.12     # seconds between telemetry sweeps
 LOOP_SLEEP = 0.01
 MAX_SPEED_COUNTS = 3400     # STS3215 ceiling, ~50 rpm
-MAX_ACCEL = 150
+MAX_ACCEL = 120
 
 # Stable by-id path: survives replug, unlike /dev/ttyACM0 vs ttyACM1.
 DEFAULT_PORT = "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B14111115-if00"

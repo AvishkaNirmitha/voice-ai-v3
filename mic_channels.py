@@ -11,6 +11,7 @@ on a plain 2-channel laptop mic.
     python3 mic_channels.py 15              # record 15s
     python3 mic_channels.py --laptop        # skip the picker, use the built-in mic
     python3 mic_channels.py --respeaker     # skip the picker, use the array
+    python3 mic_channels.py --default       # skip the picker, use the current default source
     python3 mic_channels.py --source NAME   # use an exact pactl source name
     python3 mic_channels.py --list          # just show the available mics
     python3 mic_channels.py --play-only     # replay the last recording
@@ -182,6 +183,12 @@ def main() -> None:
         src = builtin[0]
     elif "--respeaker" in args:
         src = match_source(sources, "respeaker")
+    elif "--default" in args:
+        default = pactl("get-default-source").strip()
+        src = next((s for s in sources if s["name"] == default), None)
+        if not src:
+            sys.exit(f"Default source {default!r} is not a usable mic "
+                     f"(unset, or a .monitor). Run with --list to see what is available.")
     else:
         src = pick_source(sources)
  

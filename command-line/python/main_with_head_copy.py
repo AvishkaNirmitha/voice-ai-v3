@@ -41,20 +41,6 @@ panel alongside the conversation:
 
 The neck's resting pose at startup becomes zero, so nothing jumps on connect.
 Speed and acceleration are read live from the window's sliders.
-
-ECHO CANCELLATION. The robot's own voice is removed from the mic in software
-(WebRTC AEC3, see aec.py), so any mic and speaker work together and barge-in
-still works. Give it a RAW mic -- do not run setup_respeaker.sh first.
-
-    (no mic flag)       list the mics and ask which one (Enter = default)
-    --mic NAME          pactl source to listen on (exact, or part of the name)
-    --default-mic       the system default mic, without asking
-    --laptop            the built-in mic
-    --respeaker         the ReSpeaker array
-    --speaker NAME      pactl sink to speak on    (default: the default sink)
-    --mic-channel 1     which channel of a multichannel mic (ReSpeaker: 1)
-    --no-aec            send the raw mic, for comparison
-    --agc               also let the processor level the mic
 """
 
 import asyncio
@@ -64,21 +50,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-
-
-def _arg(flag, default=None):
-    return (sys.argv[sys.argv.index(flag) + 1]
-            if flag in sys.argv and sys.argv.index(flag) + 1 < len(sys.argv)
-            else default)
-
-
-import aec
-
-# Before sounddevice is imported -- PortAudio reads the routing when it starts.
-# Asked first, so the choice is made before the slow model and head loading.
-aec.route(mic=aec.choose_mic(sys.argv), speaker=_arg("--speaker"))
-
-import numpy as np
+import pyaudio
 import sounddevice as sd
 from google import genai
 from google.genai import types
@@ -90,22 +62,23 @@ from head import (HeadMotion, HeadWindow, Plan, plan_sentence, rms_level,
 
 client = genai.Client()
 
-# --- Audio / echo cancellation -------------------------------------------
-# Mic and speaker both run at aec.RATE (16 kHz): the canceller needs the same
-# rate on both sides, and it is what Gemini takes anyway. The mic is read in
-# 10 ms frames -- the timing that was measured -- and sent in batches.
-MIC_BATCH_BYTES = 6 * aec.FRAME_BYTES   # 60 ms per message, near the old 64 ms
+# --- pyaudio config (microphone only; Piper owns the speaker) ---
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
+SEND_SAMPLE_RATE = 16000
+CHUNK_SIZE = 1024
 
-try:
-    AEC = aec.EchoCanceller(enabled="--no-aec" not in sys.argv,
-                            agc="--agc" in sys.argv)
-except Exception as e:
-    print(f"[aec] unavailable ({e}); sending the raw mic")
-    AEC = aec.EchoCanceller(enabled=False)
+pya = pyaudio.PyAudio()
 
 # --- Head -----------------------------------------------------------------
 # Created here so the tool handlers can reach it; the motion thread, the
 # window and the hardware handshake all happen in run().
+
+
+def _arg(flag, default=None):
+    return (sys.argv[sys.argv.index(flag) + 1]
+            if flag in sys.argv and sys.argv.index(flag) + 1 < len(sys.argv)
+            else default)
 
 
 HW = None               # RobotHeadController, or None for simulation only
@@ -170,14 +143,13 @@ CLAUSE_FLUSH_CHARS = 60
 # in small slices, since that write is the only place an interruption can be
 # noticed. This is what bounds barge-in latency. It is also the natural clock
 # for the loudness envelope the head rides on: one RMS reading per slice.
-# At 16 kHz a slice is exactly three of the canceller's 10 ms frames.
 WRITE_MS = 30
 
 _t0 = time.perf_counter()
 voice = PiperVoice.load(str(PIPER_MODEL))
 PIPER_RATE = voice.config.sample_rate
 SYN_CONFIG = SynthesisConfig(length_scale=LENGTH_SCALE)
-WRITE_BYTES = int(aec.RATE * WRITE_MS / 1000) * 2  # int16 mono, after resampling
+WRITE_BYTES = int(PIPER_RATE * WRITE_MS / 1000) * 2  # int16 mono
 print(f"piper loaded in {time.perf_counter() - _t0:.3f}s  ({PIPER_RATE} Hz)")
 
 # First inference allocates ONNX buffers and is measurably slower, so burn that
@@ -337,9 +309,7 @@ CONFIG = {
 }
 
 audio_queue_mic = asyncio.Queue(maxsize=5)
-
-# Tells the mic thread to stop; it cannot be cancelled like a task.
-mic_stop = threading.Event()
+audio_stream = None
 
 # Sentences waiting to be spoken, as (turn_id, text, plan). A plain thread
 # queue because the consumer is the Piper worker thread, not the event loop.
@@ -362,52 +332,23 @@ last_was_input = False
 turn_active = False
 
 
-def _offer_mic(msg):
-    """Queue a mic batch on the event loop, dropping the oldest if it is full.
-
-    The mic thread must never block: a stalled read is a gap the canceller
-    cannot line up against the speaker.
-    """
-    if audio_queue_mic.full():
-        audio_queue_mic.get_nowait()
-    audio_queue_mic.put_nowait(msg)
-
-
-def mic_worker(loop):
-    """Reads the mic in 10 ms frames, removes the robot's echo, hands it on.
-
-    Its own thread, like speak_worker: one to_thread hop per 10 ms frame would
-    make the capture timing as uneven as the event loop is busy.
-    """
-    name, ch = aec.source_info()
-    chan = int(_arg("--mic-channel", 1 if ch == 6 else 0))  # ReSpeaker ch0 is firmware-processed
-    if not 0 <= chan < ch:
-        raise SystemExit(f"--mic-channel {chan}: {name} only has {ch} channel(s)")
-    if AEC.enabled and "echo-cancel" in name:
-        print("[aec] WARNING: the mic is already a PulseAudio echo-cancel source; "
-              "two cancellers in series fight. Pass a raw mic with --mic.")
-
-    with sd.RawInputStream(samplerate=aec.RATE, channels=ch, dtype="int16",
-                           blocksize=aec.FRAME, latency="low",
-                           device=aec.pulse_device()) as inp:
-        AEC.set_latency(mic=inp.latency)
-        print(f"[aec] {'on' if AEC.enabled else 'OFF'}  mic {name} "
-              f"(channel {chan} of {ch})  delay {AEC.delay_ms} ms", flush=True)
-        batch = bytearray()
-        while not mic_stop.is_set():
-            buf, _ = inp.read(aec.FRAME)
-            frame = (bytes(buf) if ch == 1
-                     else np.frombuffer(buf, np.int16)[chan::ch].tobytes())
-            batch += AEC.process_mic(frame)
-            if len(batch) >= MIC_BATCH_BYTES:
-                loop.call_soon_threadsafe(
-                    _offer_mic, {"data": bytes(batch), "mime_type": "audio/pcm"})
-                batch.clear()
-
-
 async def listen_audio():
-    """Runs the mic thread for as long as the session lasts."""
-    await asyncio.to_thread(mic_worker, asyncio.get_running_loop())
+    """Listens for audio and puts it into the mic audio queue."""
+    global audio_stream
+    mic_info = pya.get_default_input_device_info()
+    audio_stream = await asyncio.to_thread(
+        pya.open,
+        format=FORMAT,
+        channels=CHANNELS,
+        rate=SEND_SAMPLE_RATE,
+        input=True,
+        input_device_index=mic_info["index"],
+        frames_per_buffer=CHUNK_SIZE,
+    )
+    kwargs = {"exception_on_overflow": False} if __debug__ else {}
+    while True:
+        data = await asyncio.to_thread(audio_stream.read, CHUNK_SIZE, **kwargs)
+        await audio_queue_mic.put({"data": data, "mime_type": "audio/pcm"})
 
 async def send_realtime(session):
     """Sends audio from the mic audio queue to the GenAI session."""
@@ -474,9 +415,7 @@ def speak_worker():
     would otherwise stall the microphone and the websocket.
     """
     global last_was_input
-    stream = sd.RawOutputStream(samplerate=aec.RATE, channels=1, dtype="int16",
-                                device=aec.pulse_device())
-    AEC.set_latency(speaker=stream.latency)
+    stream = sd.RawOutputStream(samplerate=PIPER_RATE, channels=1, dtype="int16")
     try:
         while True:
             item = sentence_queue.get()
@@ -502,7 +441,7 @@ def speak_worker():
             stream.start()
             interrupted = False
             for chunk in voice.synthesize(text, syn_config=SYN_CONFIG):
-                buf = aec.to_16k(chunk.audio_int16_array, PIPER_RATE).tobytes()
+                buf = chunk.audio_int16_bytes
                 for i in range(0, len(buf), WRITE_BYTES):
                     if turn_id != speak_turn:
                         interrupted = True
@@ -513,8 +452,6 @@ def speak_worker():
                     # in this loop, so it cannot eat into the audio budget.
                     HEAD.push_rms(rms_level(slice_))
                     stream.write(slice_)
-                    # The canceller's reference: exactly what just went out.
-                    AEC.feed_reference(slice_)
                 if interrupted:
                     break
             if interrupted:
@@ -659,8 +596,9 @@ async def run():
                 print(f"[head] {HW.sent} jogs sent, {HW.clipped} clipped at the "
                       f"neck's travel ({100 * HW.clipped / HW.sent:.0f}%)")
         HEAD.stop()
-        mic_stop.set()
-        AEC.close()
+        if audio_stream:
+            audio_stream.close()
+        pya.terminate()
         print("\nConnection closed.")
 
 if __name__ == "__main__":
