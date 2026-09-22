@@ -7,22 +7,22 @@ sounds like a quiet or noisy mic. This records every channel at once and splits
 them into one WAV each, so you can listen to them in isolation. Works equally
 on a plain 2-channel laptop mic.
  
-    python3 mic_channels.py                 # pick a mic from a list, record 8s
-    python3 mic_channels.py 15              # record 15s
-    python3 mic_channels.py --laptop        # skip the picker, use the built-in mic
-    python3 mic_channels.py --respeaker     # skip the picker, use the array
-    python3 mic_channels.py --default       # skip the picker, use the current default source
-    python3 mic_channels.py --source NAME   # use an exact pactl source name
-    python3 mic_channels.py --list          # just show the available mics
-    python3 mic_channels.py --play-only     # replay the last recording
+    python3 mic_channels_aec_test                 # pick a mic from a list, record 8s
+    python3 mic_channels_aec_test 15              # record 15s
+    python3 mic_channels_aec_test --laptop        # skip the picker, use the built-in mic
+    python3 mic_channels_aec_test --respeaker     # skip the picker, use the array
+    python3 mic_channels_aec_test --default       # skip the picker, use the current default source
+    python3 mic_channels_aec_test --source NAME   # use an exact pactl source name
+    python3 mic_channels_aec_test --list          # just show the available mics
+    python3 mic_channels_aec_test --play-only     # replay the last recording
 
 AEC test -- software echo cancellation (WebRTC AEC3, the canceller Chrome uses):
 
-    python3 mic_channels.py --aec --laptop            # 20s: Piper speaks, mic is cleaned
-    python3 mic_channels.py --aec 30 --source NAME    # any mic, 30s
-    python3 mic_channels.py --aec --wav out.wav       # play a WAV instead of Piper
-    python3 mic_channels.py --aec --sink NAME         # play on a specific pactl sink
-    python3 mic_channels.py --aec --channel 2         # which channel of a multichannel mic
+    python3 mic_channels_aec_test --aec --laptop            # 20s: Piper speaks, mic is cleaned
+    python3 mic_channels_aec_test --aec 30 --source NAME    # any mic, 30s
+    python3 mic_channels_aec_test --aec --wav out.wav       # play a WAV instead of Piper
+    python3 mic_channels_aec_test --aec --sink NAME         # play on a specific pactl sink
+    python3 mic_channels_aec_test --aec --channel 2         # which channel of a multichannel mic
 
   The script plays the test sound itself and hands every played frame to the
   canceller as its reference -- sound from any other app cannot be cancelled.
