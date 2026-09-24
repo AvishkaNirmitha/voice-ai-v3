@@ -13,6 +13,11 @@ Measured with mic_channels _aec_test.py --aec before being wired in here.
 Both directions must run at RATE, in whole FRAME-sized pieces. Do not stack
 this on a PulseAudio echo-cancel source (setup_respeaker.sh): two cancellers in
 series fight each other. Give it a raw mic.
+
+NOISE, as opposed to echo. AEC3 removes the robot's own voice and nothing else;
+a fan, a hiss, a barking dog are all still there afterwards, because none of
+them were ever in the reference. Denoiser (RNNoise, from xiph) handles those,
+and runs after the canceller. Off unless asked for -- see EchoCanceller.
 """
 
 import os
@@ -30,6 +35,9 @@ import soxr
 RATE = 16000                  # Gemini's input rate; the processor runs here too
 FRAME = RATE // 100           # the processor accepts exactly 10 ms frames
 FRAME_BYTES = FRAME * 2       # int16 mono
+
+RN_RATE = 48000               # RNNoise was trained at 48 kHz and accepts nothing else
+RN_FRAME = 480                # its fixed 10 ms frame
 
 
 def route(mic=None, speaker=None):
@@ -150,29 +158,87 @@ def to_16k(pcm, rate):
     return np.pad(pcm, (0, (-len(pcm)) % FRAME)).astype(np.int16)
 
 
+class Denoiser:
+    """RNNoise (xiph) wrapped as a 16 kHz mono filter over raw int16 bytes.
+
+    RNNoise only runs at 48 kHz, so every frame is resampled up, denoised, and
+    resampled back down. The two soxr resamplers keep their state between calls
+    so the frame joins are seamless, and soxr compensates its own group delay,
+    so what comes out stays aligned with what went in.
+
+    The cost is that the pair hold ~60 ms of audio between them: process()
+    returns nothing for the first few frames, then bursts of ~30 ms at a time.
+    Callers must treat it as a stream rather than frame-in, frame-out, batching
+    whatever comes back -- which is what mic_worker does anyway, so in practice
+    it costs one extra mic batch of latency and leaves the batches their usual
+    size.
+
+    Each frame also yields a speech probability -- RNNoise's own VAD, free with
+    the denoising, and the obvious thing to gate the mic on later.
+    """
+
+    def __init__(self):
+        try:
+            from pyrnnoise import rnnoise
+        except ImportError:
+            raise SystemExit(
+                "Noise suppression needs RNNoise. Run:  uv pip install pyrnnoise")
+        self._rn = rnnoise
+        self._state = rnnoise.create()
+        self._up = soxr.ResampleStream(RATE, RN_RATE, 1, dtype="int16", quality="HQ")
+        self._down = soxr.ResampleStream(RN_RATE, RATE, 1, dtype="int16", quality="HQ")
+        self._pending = np.empty(0, np.int16)   # 48 kHz samples, short of a frame
+        self.speech_prob = 0.0                  # the most recent frame's, 0..1
+
+    def process(self, pcm):
+        """int16 bytes in, int16 bytes out -- a varying, usually smaller number."""
+        self._pending = np.concatenate(
+            [self._pending, self._up.resample_chunk(np.frombuffer(pcm, np.int16))])
+        n = len(self._pending) // RN_FRAME
+        if not n:
+            return b""
+        out = []
+        for i in range(n):
+            frame, self.speech_prob = self._rn.process_mono_frame(
+                self._state, self._pending[i * RN_FRAME:(i + 1) * RN_FRAME])
+            out.append(frame)
+        self._pending = self._pending[n * RN_FRAME:]
+        return self._down.resample_chunk(np.concatenate(out)).tobytes()
+
+
 class EchoCanceller:
     """AEC3 + noise suppression + high-pass, shared by the speaker and mic threads.
 
     enabled=False turns every call into a pass-through, so the audio path stays
     identical for an A/B comparison.
+
+    denoise=True adds RNNoise after the canceller, for the room noise AEC3 was
+    never going to touch. ns=False then turns WebRTC's own suppressor off:
+    both of them suppress noise, and stacking the two can thin the speech out
+    as well, which costs more in recognition accuracy than the noise does.
     """
 
-    def __init__(self, enabled=True, agc=False):
+    def __init__(self, enabled=True, agc=False, denoise=False, ns=True):
         self._lock = threading.Lock()   # both threads call into one module
         self._mic_s = 0.0
         self._speaker_s = 0.0
         self._apm = None
+        self._denoiser = Denoiser() if denoise else None
         if enabled:
             from livekit import rtc
             self._rtc = rtc
             # AGC is off by default: that is the configuration that was measured.
             self._apm = rtc.AudioProcessingModule(
-                echo_cancellation=True, noise_suppression=True,
+                echo_cancellation=True, noise_suppression=ns,
                 high_pass_filter=True, auto_gain_control=agc)
 
     @property
     def enabled(self):
         return self._apm is not None
+
+    @property
+    def denoising(self):
+        return self._denoiser is not None
 
     @property
     def delay_ms(self):
@@ -195,16 +261,30 @@ class EchoCanceller:
                     self._rtc.AudioFrame(pcm[i:i + FRAME_BYTES], RATE, 1, FRAME))
 
     def process_mic(self, frame):
-        """One 10 ms mic frame in, the same frame with the echo removed out."""
+        """One 10 ms mic frame in, echo -- and optionally noise -- removed out.
+
+        Frame-in, frame-out only while denoising is off. With it on the result
+        is a stream: empty most calls, a longer run on the others. The caller
+        batches it either way.
+        """
         with self._lock:
-            if self._apm is None:
-                return frame
-            f = self._rtc.AudioFrame(frame, RATE, 1, FRAME)
-            self._apm.set_stream_delay_ms(self.delay_ms)
-            self._apm.process_stream(f)     # in place
-            return f.data.tobytes()
+            if self._apm is not None:
+                f = self._rtc.AudioFrame(frame, RATE, 1, FRAME)
+                self._apm.set_stream_delay_ms(self.delay_ms)
+                self._apm.process_stream(f)     # in place
+                frame = f.data.tobytes()
+        # Outside the lock deliberately: only the mic thread ever touches the
+        # denoiser, and holding the lock across it would stall the speaker
+        # thread feeding the reference in.
+        den = self._denoiser
+        return den.process(frame) if den else frame
 
     def close(self):
         # Released explicitly: livekit asserts if it is still alive at exit.
         with self._lock:
             self._apm = None
+        # Dropped, not destroyed. The mic thread can still be a frame behind
+        # this call, and freeing RNNoise's state under it would be a segfault;
+        # the process is ending anyway, so letting the allocation go with it is
+        # the safe trade.
+        self._denoiser = None

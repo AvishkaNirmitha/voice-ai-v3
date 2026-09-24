@@ -29,6 +29,22 @@ AEC test -- software echo cancellation (WebRTC AEC3, the canceller Chrome uses):
   First half: stay silent (measures echo removal). Second half: talk over it
   (checks your voice survives). Writes aec_raw / aec_clean / aec_ref WAVs.
 
+Noise suppression -- RNNoise (xiph), a small recurrent net trained on speech:
+
+    python3 mic_channels_aec_test --denoise                 # every channel, denoised as well
+    python3 mic_channels_aec_test --aec --denoise           # RNNoise after the echo canceller
+    python3 mic_channels_aec_test --aec --denoise --no-ns   # RNNoise instead of WebRTC's own NS
+
+  The AEC removes the speaker; RNNoise removes what the room adds -- fans,
+  hiss, a barking dog, a distant conversation. They solve different problems,
+  so a noisy recording usually needs both. --noise-cancel means the same thing
+  as --denoise. Each channel gets a chN_denoised.wav beside its chN.wav, and
+  the AEC test adds aec_denoised.wav, so every stage can be compared by ear.
+
+  WebRTC's NS (on by default) and RNNoise both suppress noise, and stacking two
+  suppressors can chew up the speech as well; --no-ns turns WebRTC's off so you
+  can hear what RNNoise does on its own.
+
  
 Talk, and play audio through the speaker, while it records. Then listen:
   - a live mic channel      -> your voice, clearly
@@ -57,6 +73,14 @@ PIPER_TEXT = (
     "Please stay where you are while I complete the patrol. "
     "The perimeter is secure and every camera is online."
 )
+
+# --- noise suppression ------------------------------------------------------
+RN_RATE = 48000               # RNNoise was trained at 48 kHz and accepts nothing else
+RN_FRAME = 480                # its fixed 10 ms frame
+
+
+def wants_denoise(args: list[str]) -> bool:
+    return "--denoise" in args or "--noise-cancel" in args
  
  
 def pactl(*args: str) -> str:
@@ -137,9 +161,12 @@ def record(seconds: float, src: dict) -> bytes:
     return proc.stdout
  
  
-def split_and_write(raw: bytes, ch: int) -> list[Path]:
+def split_and_write(raw: bytes, ch: int, denoise: bool = False) -> list[Path]:
     """Split interleaved frames into one mono WAV per channel."""
     import array
+    import time
+    if denoise:
+        import numpy as np
     samples = array.array("h")
     samples.frombytes(raw[: len(raw) // (2 * ch) * 2 * ch])
     total = len(samples) // ch
@@ -150,30 +177,43 @@ def split_and_write(raw: bytes, ch: int) -> list[Path]:
         stale.unlink()
  
     paths = []
+    den_s = 0.0
     print(f"  {total / RATE:.1f}s captured\n")
-    print("  ch    RMS     peak   level")
+    print("  ch    RMS" + ("   denoised" if denoise else "") + "     peak   level")
     for c in range(ch):
         chan = samples[c::ch]
         rms = (sum(float(v) * v for v in chan) / max(len(chan), 1)) ** 0.5
         peak = max((abs(v) for v in chan), default=0)
-        print(f"  {c}   {rms:7.1f}  {peak:6d}   {'#' * min(int(rms / 60), 30)}")
  
         p = OUTDIR / f"ch{c}.wav"
-        with wave.open(str(p), "wb") as w:
-            w.setnchannels(1)
-            w.setsampwidth(2)
-            w.setframerate(RATE)
-            w.writeframes(chan.tobytes())
+        write_wav(p, chan)
         paths.append(p)
+ 
+        after = ""
+        if denoise:
+            den = Denoiser()
+            t0 = time.perf_counter()
+            clean = den(np.frombuffer(chan.tobytes(), np.int16))
+            den_s += time.perf_counter() - t0
+            den.close()
+            q = OUTDIR / f"ch{c}_denoised.wav"
+            write_wav(q, clean)
+            paths.append(q)      # right after its own raw channel, so they play back in pairs
+            after = f"  {float(np.sqrt(np.mean(clean.astype(np.float64) ** 2))):8.1f}"
+        print(f"  {c}   {rms:7.1f}{after}  {peak:6d}   {'#' * min(int(rms / 60), 30)}")
+    if denoise:
+        audio_s = total / RATE * ch
+        print(f"\n  RNNoise: {den_s:.2f}s of CPU for {audio_s:.1f}s of audio over "
+              f"{ch} channel(s) -- {den_s / max(audio_s, 1e-9) * 100:.1f}% of realtime")
     return paths
  
  
 def playback(paths: list[Path]) -> None:
-    print(f"\nPlaying each channel in turn. Files are in {OUTDIR}\n")
-    for c, p in enumerate(paths):
-        input(f"  [Enter] to play channel {c}  ({p.name}) ... ")
+    print(f"\nPlaying each file in turn. Files are in {OUTDIR}\n")
+    for p in paths:
+        input(f"  [Enter] to play {p.name} ... ")
         subprocess.run(["paplay", str(p)])
-    print("\nDone. Replay any file later with:  paplay mic_channels_out/chN.wav")
+    print(f"\nDone. Replay any file later with:  paplay {OUTDIR.name}/NAME.wav")
 
 
 def load_test_sound(wav_path):
@@ -209,6 +249,58 @@ def write_wav(path: Path, pcm) -> None:
         w.writeframes(pcm.tobytes())
 
 
+class Denoiser:
+    """RNNoise (xiph) wrapped up as a 16 kHz mono filter.
+
+    RNNoise is trained at 48 kHz and accepts nothing else, so every frame is
+    resampled up, denoised, and resampled back down. The two soxr resamplers
+    keep their state between calls, so the frame joins are seamless; the price
+    is that they hold ~60 ms of audio in flight, which is why the denoised
+    stream ends that much short. soxr compensates its own group delay, so what
+    does come out stays sample-aligned with what went in.
+
+    Each frame also yields a speech probability -- RNNoise's own VAD, free with
+    the denoising, and the obvious thing to gate the mic on later.
+    """
+
+    def __init__(self):
+        import numpy as np
+        import soxr
+        try:
+            from pyrnnoise import rnnoise
+        except ImportError:
+            sys.exit("RNNoise is not installed. Run:  uv pip install pyrnnoise")
+
+        self._np = np
+        self._rn = rnnoise
+        self._state = rnnoise.create()
+        self._up = soxr.ResampleStream(RATE, RN_RATE, 1, dtype="int16", quality="HQ")
+        self._down = soxr.ResampleStream(RN_RATE, RATE, 1, dtype="int16", quality="HQ")
+        self._pending = np.empty(0, np.int16)   # 48 kHz samples, still short of a frame
+        self.speech_probs = []
+
+    def __call__(self, pcm):
+        """16 kHz int16 in, 16 kHz int16 out -- a little shorter than the input."""
+        np = self._np
+        self._pending = np.concatenate([self._pending, self._up.resample_chunk(pcm)])
+        n = len(self._pending) // RN_FRAME
+        if not n:
+            return np.empty(0, np.int16)
+        out = []
+        for i in range(n):
+            frame = self._pending[i * RN_FRAME:(i + 1) * RN_FRAME]
+            denoised, prob = self._rn.process_mono_frame(self._state, frame)
+            self.speech_probs.append(prob)
+            out.append(denoised)
+        self._pending = self._pending[n * RN_FRAME:]
+        return self._down.resample_chunk(np.concatenate(out))
+
+    def close(self) -> None:
+        if self._state is not None:
+            self._rn.destroy(self._state)
+            self._state = None
+
+
 def run_aec(src: dict, args: list[str], dur: float) -> None:
     """Play a test sound and record the mic through WebRTC AEC3 at the same time.
 
@@ -219,6 +311,7 @@ def run_aec(src: dict, args: list[str], dur: float) -> None:
     """
     import os
     import threading
+    import time
 
     if "echo-cancel" in src["name"]:
         print("WARNING: this source already runs PulseAudio's echo canceller, so\n"
@@ -252,12 +345,19 @@ def run_aec(src: dict, args: list[str], dur: float) -> None:
     ref_bytes = ref.tobytes()
 
     # Measure echo removal only; AGC would rescale the cleaned signal and skew it.
-    apm = rtc.AudioProcessingModule(echo_cancellation=True, noise_suppression=True,
+    denoise = wants_denoise(args)
+    ns = "--no-ns" not in args
+    apm = rtc.AudioProcessingModule(echo_cancellation=True, noise_suppression=ns,
                                     high_pass_filter=True, auto_gain_control=False)
     lock = threading.Lock()           # speaker thread and mic loop share the module
     stop = threading.Event()
     ready = threading.Event()
     out_latency = [0.0]
+
+    # How long each stage takes, one entry per call, in milliseconds. Only the
+    # processing itself is timed, not the wait for the lock: contention is a
+    # property of this script's two threads, not of the filters.
+    aec_ms, ref_ms, den_ms = [], [], []
 
     names = [d["name"] for d in sd.query_devices()]
     dev = "pulse" if "pulse" in names else None
@@ -275,13 +375,17 @@ def run_aec(src: dict, args: list[str], dur: float) -> None:
                 out.write(piece)
                 # The reference is exactly what was just handed to the speaker.
                 with lock:
+                    t0 = time.perf_counter()
                     apm.process_reverse_stream(rtc.AudioFrame(piece, RATE, 1, FRAME))
+                    ref_ms.append((time.perf_counter() - t0) * 1000)
 
     quiet = nframes // 2
-    raw, clean = [], []
+    raw, clean, dn = [], [], []
+    den = Denoiser() if denoise else None
     overflows = 0
     print(f"\nMic    : {src['desc']}  (channel {chan} of {ch})")
     print(f"Speaker: {sink}")
+    print("Filters: AEC" + (" + WebRTC NS" if ns else "") + (" + RNNoise" if denoise else ""))
     print(f"\n  >>> STAY SILENT for {quiet / 100:.0f}s -- measuring echo removal <<<\n")
 
     with sd.RawInputStream(samplerate=RATE, channels=ch, dtype="int16",
@@ -302,46 +406,97 @@ def run_aec(src: dict, args: list[str], dur: float) -> None:
                 raw.append(mic)
                 frame = rtc.AudioFrame(mic.tobytes(), RATE, 1, FRAME)
                 with lock:
+                    t0 = time.perf_counter()
                     apm.set_stream_delay_ms(delay_ms)
                     apm.process_stream(frame)   # in place
-                clean.append(np.array(frame.data, dtype=np.int16))
+                    aec_ms.append((time.perf_counter() - t0) * 1000)
+                cleaned = np.array(frame.data, dtype=np.int16)
+                clean.append(cleaned)
+                if den:
+                    t0 = time.perf_counter()
+                    dn.append(den(cleaned))
+                    den_ms.append((time.perf_counter() - t0) * 1000)
         finally:
             stop.set()
             t.join()
+            if den:
+                den.close()
     # Release it now: livekit asserts if it is still alive at interpreter exit.
     del apm
 
     raw = np.concatenate(raw)
     clean = np.concatenate(clean)
+    if den:
+        # The resamplers keep ~60 ms in flight, so the denoised stream ends that
+        # much short. It is still sample-aligned, so padding the tail is enough
+        # to keep the three signals comparable.
+        dn = np.concatenate(dn)
+        dn = np.pad(dn, (0, max(0, len(clean) - len(dn))))[:len(clean)]
 
     OUTDIR.mkdir(exist_ok=True)
-    paths = [OUTDIR / "aec_raw.wav", OUTDIR / "aec_clean.wav", OUTDIR / "aec_ref.wav"]
-    for p, pcm in zip(paths, (raw, clean, ref[:len(raw)])):
+    outputs = [("aec_raw.wav", raw), ("aec_clean.wav", clean)]
+    if den:
+        outputs.append(("aec_denoised.wav", dn))
+    outputs.append(("aec_ref.wav", ref[:len(raw)]))
+    paths = [OUTDIR / name for name, _ in outputs]
+    for p, (_, pcm) in zip(paths, outputs):
         write_wav(p, pcm)
+    stale = OUTDIR / "aec_denoised.wav"
+    if not den and stale.exists():
+        stale.unlink()   # left by an earlier --denoise run; keeping it would mislead
 
     def rms(x):
         return float(np.sqrt(np.mean(x.astype(np.float64) ** 2))) if len(x) else 0.0
 
     a, b = int(AEC_SKIP_S * RATE), quiet * FRAME
-    echo_raw, echo_clean = rms(raw[a:b]), rms(clean[a:b])
-    talk_raw, talk_clean = rms(raw[b:]), rms(clean[b:])
-    reduction = 20 * np.log10(max(echo_raw, 1e-9) / max(echo_clean, 1e-9))
+    cols = [("raw", raw), ("AEC", clean)] + ([("+RNNoise", dn)] if den else [])
+    echo = [rms(x[a:b]) for _, x in cols]
+    talk = [rms(x[b:]) for _, x in cols]
+    reduction = 20 * np.log10(max(echo[0], 1e-9) / max(echo[1], 1e-9))
 
-    print(f"  {'':22} {'raw':>8} {'cleaned':>8}")
-    print(f"  {'echo only (silent)':22} {echo_raw:8.1f} {echo_clean:8.1f}   "
-          f"-> echo reduced by {reduction:.1f} dB")
-    print(f"  {'you talking over it':22} {talk_raw:8.1f} {talk_clean:8.1f}")
+    print("  " + f"{'':22}" + "".join(f"{name:>9}" for name, _ in cols))
+    print("  " + f"{'echo only (silent)':22}" + "".join(f"{v:9.1f}" for v in echo)
+          + f"   -> echo reduced by {reduction:.1f} dB")
+    print("  " + f"{'you talking over it':22}" + "".join(f"{v:9.1f}" for v in talk))
     if overflows:
         print(f"\n  {overflows} mic overflow(s) -- frames were dropped, results are less reliable")
-    if echo_raw < 50:
+    if echo[0] < 50:
         print("\n  The raw mic barely heard the speaker -- turn the volume up, or the\n"
               "  reduction figure is just measuring background noise.")
     print("\n  Rough guide: <10 dB poor, 15-25 dB good, >25 dB excellent (Chrome-like).")
 
-    print(f"\nFiles are in {OUTDIR}\n")
-    for p in paths[:2]:
-        input(f"  [Enter] to play {p.name} ... ")
-        subprocess.run(["paplay", str(p)])
+    if den:
+        extra = 20 * np.log10(max(echo[1], 1e-9) / max(echo[2], 1e-9))
+        probs = np.array(den.speech_probs)
+        print(f"\n  RNNoise took a further {extra:.1f} dB off what the AEC left behind.")
+        if len(probs):
+            print(f"  Its speech detector read {probs[:quiet].mean():.2f} while you were silent "
+                  f"and {probs[quiet:].mean():.2f} while you talked --\n"
+                  f"  a free VAD to gate the mic on, so the room never reaches the recogniser.")
+        print("  Compare aec_clean against aec_denoised: if your voice sounds thinner, two\n"
+              "  suppressors are fighting -- try --no-ns to leave RNNoise on its own.")
+
+    # What each stage costs. A 10 ms frame has 10 ms to be processed in, so the
+    # mean as a percentage of that is the realtime factor: anything approaching
+    # 100% will not keep up here, let alone on a Jetson.
+    def timing(label, ms):
+        if ms:
+            mean = sum(ms) / len(ms)
+            print(f"    {label:32}{mean:8.3f}{max(ms):9.3f}{mean / 10 * 100:11.1f}%")
+
+    print(f"\n  Time per 10 ms frame, in ms:{'':6}{'mean':>8}{'max':>9}{'of realtime':>12}")
+    timing("AEC3, mic (process_stream)", aec_ms)
+    timing("AEC3, reference (speaker thread)", ref_ms)
+    timing("RNNoise (resample + denoise)", den_ms)
+    if den_ms and aec_ms:
+        # Only worth a total when there is more than one stage in the capture
+        # loop. The reference is left out: it runs on the speaker thread.
+        mic_path = sum(sum(x) / len(x) for x in (aec_ms, den_ms))
+        print(f"    {'mic path total':32}{mic_path:8.3f}{'':9}{mic_path / 10 * 100:11.1f}%")
+        print("    RNNoise's max is high because it does nothing on most frames and a\n"
+              "    batch of work on the rest; the mean is the figure that matters.")
+
+    playback(paths[:-1])   # everything but the reference, which is just the test sound
  
  
 def main() -> None:
@@ -400,7 +555,7 @@ def main() -> None:
         return
 
     raw = record(dur, src)
-    paths = split_and_write(raw, src["channels"])
+    paths = split_and_write(raw, src["channels"], wants_denoise(args))
     playback(paths)
  
  

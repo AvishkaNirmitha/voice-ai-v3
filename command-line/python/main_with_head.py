@@ -55,6 +55,19 @@ still works. Give it a RAW mic -- do not run setup_respeaker.sh first.
     --mic-channel 1     which channel of a multichannel mic (ReSpeaker: 1)
     --no-aec            send the raw mic, for comparison
     --agc               also let the processor level the mic
+
+NOISE SUPPRESSION. Echo cancellation removes the robot's own voice and nothing
+else -- a fan, a hiss, a dog barking outside are all still on the wire. RNNoise
+removes those, after the canceller. Off by default, because a denoiser that is
+working too hard thins the speech out too, and modern recognisers lose more to
+that than they do to the noise:
+
+    --denoise           run RNNoise on the mic (--noise-cancel means the same)
+    --no-ns             with it, drop WebRTC's own suppressor so the two are
+                        not stacked -- try this if your voice sounds hollow
+
+    Needs:  uv pip install pyrnnoise
+    Costs:  ~5% of one core, and ~60 ms of mic latency (one extra batch).
 """
 
 import asyncio
@@ -96,12 +109,18 @@ client = genai.Client()
 # 10 ms frames -- the timing that was measured -- and sent in batches.
 MIC_BATCH_BYTES = 6 * aec.FRAME_BYTES   # 60 ms per message, near the old 64 ms
 
+DENOISE = "--denoise" in sys.argv or "--noise-cancel" in sys.argv
+
 try:
     AEC = aec.EchoCanceller(enabled="--no-aec" not in sys.argv,
-                            agc="--agc" in sys.argv)
+                            agc="--agc" in sys.argv,
+                            denoise=DENOISE, ns="--no-ns" not in sys.argv)
 except Exception as e:
+    # RNNoise is worth keeping even when AEC3 is the thing that failed: they
+    # remove different sounds. A missing pyrnnoise raises SystemExit, not
+    # Exception, so --denoise without it still stops here with its own message.
     print(f"[aec] unavailable ({e}); sending the raw mic")
-    AEC = aec.EchoCanceller(enabled=False)
+    AEC = aec.EchoCanceller(enabled=False, denoise=DENOISE)
 
 # --- Head -----------------------------------------------------------------
 # Created here so the tool handlers can reach it; the motion thread, the
@@ -391,7 +410,8 @@ def mic_worker(loop):
                            blocksize=aec.FRAME, latency="low",
                            device=aec.pulse_device()) as inp:
         AEC.set_latency(mic=inp.latency)
-        print(f"[aec] {'on' if AEC.enabled else 'OFF'}  mic {name} "
+        print(f"[aec] {'on' if AEC.enabled else 'OFF'}"
+              f"{'  +rnnoise' if AEC.denoising else ''}  mic {name} "
               f"(channel {chan} of {ch})  delay {AEC.delay_ms} ms", flush=True)
         batch = bytearray()
         while not mic_stop.is_set():
