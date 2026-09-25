@@ -68,6 +68,18 @@ that than they do to the noise:
 
     Needs:  uv pip install pyrnnoise
     Costs:  ~5% of one core, and ~60 ms of mic latency (one extra batch).
+
+RECORDING WHAT THE MIC HEARD. Each thing the user says is saved twice -- once as
+it arrived and once as Gemini received it -- so the filters can be judged on
+real speech in a real room instead of on a test tone:
+
+    --save-audio        write recordings/mic-<timestamp>-raw.wav and -clean.wav
+    --verbose           also name each file as it is written
+
+  The cuts are Gemini's own voice activity signals, not a second VAD of our
+  own, so each pair holds exactly what the model treated as one turn. All of
+  the work happens on a writer thread; the mic path only hands over bytes. See
+  mic_record.py.
 """
 
 import asyncio
@@ -121,6 +133,14 @@ except Exception as e:
     # Exception, so --denoise without it still stops here with its own message.
     print(f"[aec] unavailable ({e}); sending the raw mic")
     AEC = aec.EchoCanceller(enabled=False, denoise=DENOISE)
+
+# Saving is opt-in: it writes to disk for as long as the robot runs, which is
+# not something a patrol should start doing because a flag was forgotten.
+REC = None
+if "--save-audio" in sys.argv:
+    import mic_record
+    REC = mic_record.Recorder(Path(__file__).resolve().parent / "recordings",
+                              verbose="--verbose" in sys.argv)
 
 # --- Head -----------------------------------------------------------------
 # Created here so the tool handlers can reach it; the motion thread, the
@@ -418,7 +438,10 @@ def mic_worker(loop):
             buf, _ = inp.read(aec.FRAME)
             frame = (bytes(buf) if ch == 1
                      else np.frombuffer(buf, np.int16)[chan::ch].tobytes())
-            batch += AEC.process_mic(frame)
+            cleaned = AEC.process_mic(frame)
+            if REC:
+                REC.offer(frame, cleaned)   # a bounded put; never blocks
+            batch += cleaned
             if len(batch) >= MIC_BATCH_BYTES:
                 loop.call_soon_threadsafe(
                     _offer_mic, {"data": bytes(batch), "mime_type": "audio/pcm"})
@@ -556,6 +579,15 @@ async def receive_audio(session):
     while True:
         turn = session.receive()
         async for response in turn:
+            # Before server_content is checked: a message can carry a voice
+            # activity signal and nothing else, and it would be skipped below.
+            va = getattr(response, "voice_activity", None)
+            if va is not None and REC:
+                # Compared as text, not against the enum, so an SDK that sends
+                # a bare string here still segments correctly.
+                kind = str(getattr(va, "voice_activity_type", ""))
+                REC.vad(kind.endswith("ACTIVITY_START"),
+                        getattr(va, "audio_offset", None))
             if response.tool_call:
                 await handle_tool_call(session, response.tool_call)
                 continue
@@ -583,6 +615,8 @@ async def receive_audio(session):
                     enqueue(sentence)
             if sc.input_transcription:
                 HEAD.saw_input()
+                if REC:
+                    REC.fallback(True)  # no-op once Gemini's own VAD has spoken
                 if not last_was_input:
                     print()
                     last_was_input = True
@@ -597,6 +631,8 @@ async def receive_audio(session):
             enqueue(text_buffer.strip())
             text_buffer = ""
         turn_active = False
+        if REC:
+            REC.fallback(False)
         # If the worker already drained the queue it could not know the turn
         # was still open, so the offer is made from here instead. It no-ops
         # while anything is still being spoken.
@@ -607,6 +643,8 @@ async def run():
     """Main function to run the audio loop."""
     global speak_turn, HEAD_PRESENT
     HEAD.start()
+    if REC:
+        REC.start()
 
     # Ask the neck how far it actually travels before anything is drawn or
     # driven: the sliders take their range from it, and the mixer clamps to it.
@@ -681,6 +719,13 @@ async def run():
         HEAD.stop()
         mic_stop.set()
         AEC.close()
+        if REC:
+            REC.close()     # flushes an utterance that was still open
+            print(f"[rec] {REC.written} utterance(s) saved to {REC.outdir}"
+                  + (f", {REC.dropped} mic frame(s) dropped" if REC.dropped else "")
+                  + ("\n[rec] cut on Gemini's voice activity" if REC.saw_vad else
+                     "\n[rec] cut on transcripts -- the model sent no voice "
+                     "activity signals, so the edges are approximate"))
         print("\nConnection closed.")
 
 if __name__ == "__main__":
