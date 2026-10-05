@@ -868,6 +868,8 @@ class HeadWindow:
     W, H = 500, 430
     CX, CY = 250, 152
 
+    TEST_HOLD_S = 1.5       # torque test: travel to a stop plus the dwell there
+
     def __init__(self, motion):
         self.motion = motion
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -940,6 +942,7 @@ class HeadWindow:
             return s
 
         def engage():
+            stop_test()
             manual_var.set(True)
             self.motion.set_manual(True)
             self.motion.set_manual_pose(pan_s.get(), tilt_s.get())
@@ -950,22 +953,66 @@ class HeadWindow:
             self.motion.set_manual_pose(pan_s.get(), tilt_s.get())
 
         def on_manual_toggle():
+            stop_test()
             self.motion.set_manual(manual_var.get())
             if manual_var.get():
                 self.motion.set_manual_pose(pan_s.get(), tilt_s.get())
 
-        def centre():
+        def goto(pan, tilt):
             self._syncing = True
-            pan_s.set(0.0)
-            tilt_s.set(0.0)
+            pan_s.set(pan)
+            tilt_s.set(tilt)
             self._syncing = False
             manual_var.set(True)
             self.motion.set_manual(True)
-            self.motion.set_manual_pose(0.0, 0.0)
+            self.motion.set_manual_pose(pan, tilt)
+
+        def centre():
+            stop_test()
+            goto(0.0, 0.0)
+
+        def release():
+            stop_test()
+            manual_var.set(False)
+            self.motion.set_manual(False)
+
+        # TORQUE TEST. Walks the neck to each end of its travel and HOLDS it
+        # there, one axis at a time, round and round until stopped. The hold is
+        # the point: a servo that reaches the stop but cannot keep the head
+        # there sags or buzzes during the dwell, which a gesture sweeping
+        # straight back through never shows. Driven through the manual pose, so
+        # it goes exactly where the sliders would and no further than the
+        # travel the neck reported.
+        test = {"job": None, "step": 0}
+
+        def test_step():
+            m = self.motion
+            stops = ((m.pan_min, 0.0), (m.pan_max, 0.0), (0.0, 0.0),
+                     (0.0, m.tilt_max), (0.0, m.tilt_min), (0.0, 0.0))
+            goto(*stops[test["step"] % len(stops)])
+            test["step"] += 1
+            test["job"] = root.after(int(self.TEST_HOLD_S * 1000), test_step)
+
+        def stop_test():
+            if test["job"] is None:
+                return False
+            root.after_cancel(test["job"])
+            test["job"] = None
+            test_b.config(text="torque test", bg="#232833")
+            return True
+
+        def toggle_test():
+            if stop_test():
+                goto(0.0, 0.0)      # leave the neck resting, not at a stop
+                return
+            test["step"] = 0
+            test_b.config(text="stop test", bg="#8a3b2a")
+            test_step()
 
         def fire(name):
             # A gesture is a mixer product, so previewing one has to hand the
             # head back to the mixer first.
+            stop_test()
             manual_var.set(False)
             self.motion.set_manual(False)
             dur = 1.8
@@ -980,9 +1027,9 @@ class HeadWindow:
                        activeforeground="#fff", font=("monospace", 9),
                        highlightthickness=0, bd=0).pack(side="left")
         btn(row1, "centre", centre, 8).pack(side="left", padx=6)
-        btn(row1, "release", lambda: (manual_var.set(False),
-                                      self.motion.set_manual(False)), 8
-            ).pack(side="left")
+        btn(row1, "release", release, 8).pack(side="left")
+        test_b = btn(row1, "torque test", toggle_test, 12)
+        test_b.pack(side="left", padx=6)
 
         pan_s = slider(ctrl, "pan   - left / + right",
                        self.motion.pan_min, self.motion.pan_max)

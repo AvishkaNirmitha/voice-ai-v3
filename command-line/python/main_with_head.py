@@ -47,14 +47,22 @@ ECHO CANCELLATION. The robot's own voice is removed from the mic in software
 still works. Give it a RAW mic -- do not run setup_respeaker.sh first.
 
     (no mic flag)       list the mics and ask which one (Enter = default)
-    --mic NAME          pactl source to listen on (exact, or part of the name)
+    --mic NAME          which mic: a source name, a port name, or part of either
+    --mic-port NAME     which socket of that source, when it has more than one
     --default-mic       the system default mic, without asking
-    --laptop            the built-in mic
+    --laptop            the built-in sound card
     --respeaker         the ReSpeaker array
     --speaker NAME      pactl sink to speak on    (default: the default sink)
     --mic-channel 1     which channel of a multichannel mic (ReSpeaker: 1)
     --no-aec            send the raw mic, for comparison
     --agc               also let the processor level the mic
+
+  A laptop's built-in mic and whatever is plugged into its 3.5 mm jack are one
+  source with two PORTS, not two sources -- which is why a headset the desktop
+  lists plainly has no name of its own in `pactl list sources`. Both are offered
+  separately here, and picking one switches the source over to it, exactly as
+  the desktop's sound panel does. Naming a source rather than a port leaves
+  whichever port is already live alone.
 
 NOISE SUPPRESSION. Echo cancellation removes the robot's own voice and nothing
 else -- a fan, a hiss, a dog barking outside are all still on the wire. RNNoise
@@ -639,6 +647,26 @@ async def receive_audio(session):
         if sentence_queue.empty():
             HEAD.turn_complete()
 
+def _report(failures):
+    """Say why the session ended, without making a hiccup look like a crash.
+
+    A TaskGroup reports everything as a group, so one dropped websocket arrives
+    as a forty-line traceback through asyncio and the SDK, none of it this
+    file's code. Gemini closing the socket -- 1011 and its relatives -- is a
+    server-side event and deserves one line. Anything unfamiliar keeps its
+    traceback, because that is the kind that might actually be our bug.
+    """
+    import traceback
+    from google.genai import errors as genai_errors
+    for exc in failures:
+        transport = (isinstance(exc, (genai_errors.APIError, ConnectionError, OSError))
+                     or "ConnectionClosed" in type(exc).__name__)
+        if transport:
+            print(f"\n[gemini] session ended: {type(exc).__name__}: {exc}")
+        else:
+            traceback.print_exception(exc)
+
+
 async def run():
     """Main function to run the audio loop."""
     global speak_turn, HEAD_PRESENT
@@ -695,6 +723,10 @@ async def run():
                 tg.create_task(receive_audio(live_session))
     except asyncio.CancelledError:
         pass
+    except BaseExceptionGroup as eg:
+        _report(eg.exceptions)
+    except Exception as e:
+        _report([e])
     finally:
         speak_turn += 1  # cuts any in-flight speech short
         sentence_queue.put(None)

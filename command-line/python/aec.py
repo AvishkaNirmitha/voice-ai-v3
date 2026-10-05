@@ -60,9 +60,24 @@ def _pactl(*args):
         return ""
 
 
+# A port line inside a source block, e.g.
+#     \t\tanalog-input-headset-mic: Headset Microphone (type: Headset, ...)
+# Nothing else indented that far carries a "(type:", so this cannot collide
+# with the Formats or Properties sections.
+_PORT = re.compile(r"^\t\t(\S+?): (.+?) \(type:([^)]*)\)$", re.M)
+
+
 def list_sources():
-    """Every real input source as {name, channels, desc}. Monitors are skipped:
-    they are loopbacks of an output, not microphones."""
+    """Every real input source as {name, channels, desc, ports, active_port}.
+
+    Monitors are skipped: they are loopbacks of an output, not microphones.
+
+    A source's PORTS are the sockets behind it. A laptop's built-in mic and
+    whatever is plugged into its 3.5 mm jack are almost always one source with
+    two ports, not two sources -- so a headset that the desktop's sound panel
+    lists plainly does not appear anywhere in `pactl list sources` as a name of
+    its own. Reading the ports is the only way to see it.
+    """
     out = []
     for block in re.split(r"\nSource #", "\n" + _pactl("list", "sources")):
         name = re.search(r"^\s*Name:\s*(\S+)", block, re.M)
@@ -70,67 +85,143 @@ def list_sources():
             continue
         spec = re.search(r"^\s*Sample Specification:\s*\S+\s+(\d+)ch", block, re.M)
         desc = re.search(r"^\s*Description:\s*(.+)$", block, re.M)
+        active = re.search(r"^\s*Active Port:\s*(\S+)", block, re.M)
         out.append({"name": name.group(1),
                     "channels": int(spec.group(1)) if spec else 1,
-                    "desc": desc.group(1).strip() if desc else name.group(1)})
+                    "desc": desc.group(1).strip() if desc else name.group(1),
+                    "active_port": active.group(1) if active else None,
+                    "ports": [{"name": pn, "desc": pd.strip(),
+                               "available": "not available" not in info}
+                              for pn, pd, info in _PORT.findall(block)]})
     return out
 
 
-def _match(sources, needle):
-    hits = [s for s in sources if needle.lower() in s["name"].lower()]
-    # Prefer the exact name, then anything that is not already echo-cancelled.
-    hits.sort(key=lambda s: (s["name"] != needle, "echo-cancel" in s["name"]))
+def mic_options():
+    """Everything a person can actually pick, the way the sound panel lists it.
+
+    One entry per port on a multi-port source, one per source otherwise --
+    there is nothing to choose between when a device has a single socket.
+    """
+    out = []
+    for s in list_sources():
+        if len(s["ports"]) < 2:
+            out.append({"source": s["name"], "port": None, "desc": s["desc"],
+                        "channels": s["channels"], "current": True,
+                        "available": True})
+            continue
+        for port in s["ports"]:
+            out.append({"source": s["name"], "port": port["name"],
+                        "desc": f"{port['desc']} - {s['desc']}",
+                        "channels": s["channels"],
+                        "current": port["name"] == s["active_port"],
+                        "available": port["available"]})
+    return out
+
+
+def _match(options, needle):
+    """The option a --mic or --mic-port value names.
+
+    Port names and labels are searched as well as source names, so --mic
+    headset finds a headset jack that has no source name of its own.
+    """
+    n = needle.lower()
+    def names_port(o):
+        return n in (o["port"] or "").lower() or n in o["desc"].lower()
+
+    hits = [o for o in options if n in o["source"].lower() or names_port(o)]
+    hits.sort(key=lambda o: (
+        o["source"] != needle,              # an exact source name wins
+        "echo-cancel" in o["source"],       # never stack two cancellers
+        not names_port(o),                  # then a port the needle actually names
+        not o["current"],                   # failing that, leave the live port alone
+    ))
     if not hits:
-        raise SystemExit(f"No mic matching {needle!r}. Available:\n  "
-                         + "\n  ".join(s["name"] for s in sources))
-    return hits[0]["name"]
+        raise SystemExit(f"No mic matching {needle!r}. Available:\n  " + "\n  ".join(
+            o["desc"] + (f"  [port {o['port']}]" if o["port"] else "")
+            for o in options))
+    return hits[0]
+
+
+def select(option):
+    """Commit to an option, switching the source's port if that is what it is.
+
+    Switching a port is what the desktop's own list does when you click it; the
+    source keeps its name, which is why route() only ever needs the name.
+    """
+    if option["port"] and not option["current"]:
+        _pactl("set-source-port", option["source"], option["port"])
+        print(f"[mic] {option['source']} -> port {option['port']}")
+    return option["source"]
 
 
 def choose_mic(argv):
     """The pactl source to listen on, or None for the system default.
 
-        --mic NAME      exact name, or any unique part of it
-        --default-mic   the system default, no questions
-        --laptop        the built-in mic
-        --respeaker     the ReSpeaker array
-        (none)          ask, when there is a terminal to ask on
+        --mic NAME       source name, port name, or any unique part of either
+        --mic-port NAME  which socket of that source -- a headset jack, say
+        --default-mic    the system default, no questions
+        --laptop         the built-in sound card
+        --respeaker      the ReSpeaker array
+        (none)           ask, when there is a terminal to ask on
     """
-    sources = list_sources()
+    options = mic_options()
+    want_port = (argv[argv.index("--mic-port") + 1]
+                 if "--mic-port" in argv and argv.index("--mic-port") + 1 < len(argv)
+                 else None)
+
+    def commit(option):
+        """Apply --mic-port to whatever source was settled on, then select it."""
+        if want_port:
+            source = option["source"] if option else _pactl("get-default-source").strip()
+            on_source = [o for o in options if o["source"] == source and o["port"]]
+            if not on_source:
+                raise SystemExit(f"{source} has no switchable ports, so --mic-port "
+                                 f"{want_port!r} has nothing to act on.")
+            return select(_match(on_source, want_port))
+        return select(option) if option else None
+
     if "--mic" in argv and argv.index("--mic") + 1 < len(argv):
-        return _match(sources, argv[argv.index("--mic") + 1])
-    if "--default-mic" in argv or not sources:
-        return None
+        return commit(_match(options, argv[argv.index("--mic") + 1]))
+    if "--default-mic" in argv or not options:
+        return commit(None)
     if "--laptop" in argv:
         # Onboard audio: any real ALSA capture device that is not the array.
         # Not "pci-" -- on a Jetson it shows up as platform-/tegra- instead.
-        builtin = [s for s in sources if s["name"].startswith("alsa_input.")
-                   and "respeaker" not in s["name"].lower()]
+        builtin = [o for o in options if o["source"].startswith("alsa_input.")
+                   and "respeaker" not in o["source"].lower()]
         if not builtin:
             raise SystemExit("No built-in mic found.")
-        return builtin[0]["name"]
+        # Whichever port is already live, unless --mic-port overrides it.
+        return commit(next((o for o in builtin if o["current"]), builtin[0]))
     if "--respeaker" in argv:
-        return _match(sources, "respeaker")
+        return commit(_match(options, "respeaker"))
     if not sys.stdin.isatty():
-        return None     # headless (a service): nobody to ask
+        return commit(None)     # headless (a service): nobody to ask
 
     default = _pactl("get-default-source").strip()
     print("\nAvailable microphones:\n")
-    for i, s in enumerate(sources):
+    for i, o in enumerate(options):
         notes = []
-        if s["name"] == default:
+        if o["source"] == default and o["current"]:
             notes.append("current default")
-        if "echo-cancel" in s["name"]:
+        elif o["current"]:
+            notes.append("selected port")
+        if not o["available"]:
+            notes.append("nothing plugged in")
+        if "echo-cancel" in o["source"]:
             notes.append("already echo-cancelled -- not recommended")
-        print(f"  [{i}] {s['desc']}")
-        print(f"      {s['name']}")
-        print(f"      {s['channels']} channel(s)"
+        print(f"  [{i}] {o['desc']}")
+        print(f"      {o['source']}")
+        if o["port"]:
+            print(f"      port {o['port']}")
+        print(f"      {o['channels']} channel(s)"
               + (f"  <- {', '.join(notes)}" if notes else "") + "\n")
     while True:
-        raw = input(f"Which mic? [0-{len(sources) - 1}, Enter = default] ").strip()
+        raw = input(f"Which mic? [0-{len(options) - 1}, Enter = default] ").strip()
         if not raw:
-            return None
-        if raw.isdigit() and int(raw) < len(sources):
-            return sources[int(raw)]["name"]
+            return commit(None)
+        if raw.isdigit() and int(raw) < len(options):
+            return commit(options[int(raw)])
         print("  not a valid number")
 
 
